@@ -1,18 +1,18 @@
 /**
- * Sponsored (Paymaster) Frame Transaction
+ * Sponsored (Paymaster) Frame Transaction (EIP-8141 Example 3)
  *
- * Demonstrates how a third party can pay gas on behalf of the sender
- * using three frames:
+ * Demonstrates how a third party can pay gas on behalf of the sender:
  *
- *   Frame 0 (VERIFY):   The sender's validator approves the transaction.
- *   Frame 1 (SENDER):   The sender's intended action (a contract call).
- *   Frame 2 (DEFAULT):  Runs as the entry point (0xaa), executing paymaster
- *                        logic that deducts fees from the sponsor rather
- *                        than the sender's balance.
- *
- * The DEFAULT frame is the key: it executes at the protocol entry point
- * address, which has special authority to manage gas payment on behalf
- * of an external sponsor.
+ *   Frame 0 (VERIFY):   Default code checks the sender's signature and calls
+ *                        APPROVE(EXECUTION) -- execution only, no payment.
+ *   Frame 1 (VERIFY):   The sponsor's paymaster contract validates the
+ *                        request (it may inspect `tx.signatures` via SIGPARAM
+ *                        and the next frame via FRAMEPARAM) and calls
+ *                        APPROVE(PAYMENT). The sponsor becomes the `payer`.
+ *   Frame 2 (SENDER):   The sender pays the sponsor in ERC-20 tokens.
+ *   Frame 3 (SENDER):   The sender's intended action (a contract call).
+ *   Frame 4 (DEFAULT):  Optional post-op run as the entry point (0xaa), e.g.
+ *                        refunding unused fees.
  */
 
 import {
@@ -22,26 +22,40 @@ import {
   type Hex,
   http,
   parseGwei,
-  serializeTransaction,
+  parseUnits,
   type TransactionSerializableEIP8141,
 } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
+import { sendRawTransaction } from 'viem/actions'
 
 const RPC_URL = 'https://rpc1.eip-8141.ethrex.xyz'
 const CHAIN_ID = 3151908
 
-// Demo addresses.
-const sender: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266'
-const validator: Address = '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512'
-const paymaster: Address = '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0'
-const targetContract: Address = '0x5FbDB2315678afecb367f032d93F642f64180aa3'
+// Demo key and addresses -- replace with your own for a real network.
+const PRIVATE_KEY = (process.env.PRIVATE_KEY ??
+  '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80') as Hex
 
-const validatorAbi = [
+const account = privateKeyToAccount(PRIVATE_KEY)
+const paymaster: Address = '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0'
+const feeToken: Address = '0x5FbDB2315678afecb367f032d93F642f64180aa3'
+const targetContract: Address = '0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9'
+
+const DEFAULT = 0
+const VERIFY = 1
+const SENDER = 2
+const APPROVE_PAYMENT = 0x01
+const APPROVE_EXECUTION = 0x02
+
+const erc20Abi = [
   {
-    name: 'validate',
+    name: 'transfer',
     type: 'function',
-    inputs: [{ name: 'txHash', type: 'bytes32' }],
-    outputs: [],
-    stateMutability: 'view',
+    inputs: [
+      { name: 'to', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+    stateMutability: 'nonpayable',
   },
 ] as const
 
@@ -56,55 +70,81 @@ const storageAbi = [
   },
 ] as const
 
-// The paymaster contract's `sponsorGas` method is invoked in the DEFAULT
-// frame. This runs at the entry point address and arranges for the
-// sponsor to cover all gas costs.
+// The paymaster's VERIFY entry point checks that frame 2 pays it enough
+// tokens for the transaction's `max_cost`, then calls APPROVE(PAYMENT).
+// Its DEFAULT post-op refunds the unused portion.
 const paymasterAbi = [
   {
-    name: 'sponsorGas',
+    name: 'validate',
     type: 'function',
-    inputs: [
-      { name: 'sponsor', type: 'address' },
-      { name: 'sender', type: 'address' },
-    ],
+    inputs: [{ name: 'maxTokenFee', type: 'uint256' }],
+    outputs: [],
+    stateMutability: 'view',
+  },
+  {
+    name: 'postOp',
+    type: 'function',
+    inputs: [{ name: 'sender', type: 'address' }],
     outputs: [],
     stateMutability: 'nonpayable',
   },
 ] as const
 
+const maxTokenFee = parseUnits('5', 6) // up to 5 USDC for gas
+
 const tx: TransactionSerializableEIP8141 = {
   type: 'eip8141',
   chainId: CHAIN_ID,
   nonce: 1,
-  sender,
+  sender: account.address,
   maxPriorityFeePerGas: parseGwei('1'),
   maxFeePerGas: parseGwei('10'),
-  maxFeePerBlobGas: 0n,
-  blobVersionedHashes: [],
   frames: [
-    // Frame 0 -- VERIFY: sender's validator authorises.
-    // flags=0x03 means approval scope covers all subsequent frames.
+    // Frame 0 -- VERIFY: default code checks `signatures[0]` and approves
+    // execution only. Payment is left to the sponsor.
     {
-      mode: 1,
-      flags: 0x03,
-      target: validator,
-      gasLimit: 50_000n,
+      mode: VERIFY,
+      flags: APPROVE_EXECUTION,
+      target: null,
+      limits: { execution: 30_000n, state: 0n },
+      value: 0n,
+      data: '0x',
+    },
+
+    // Frame 1 -- VERIFY: paymaster validates and approves payment.
+    {
+      mode: VERIFY,
+      flags: APPROVE_PAYMENT,
+      target: paymaster,
+      limits: { execution: 50_000n, state: 0n },
       value: 0n,
       data: encodeFunctionData({
-        abi: validatorAbi,
+        abi: paymasterAbi,
         functionName: 'validate',
-        args: [
-          '0x0000000000000000000000000000000000000000000000000000000000000001',
-        ],
+        args: [maxTokenFee],
       }),
     },
 
-    // Frame 1 -- SENDER: the user's actual intent, runs as tx.sender.
+    // Frame 2 -- SENDER: pay the sponsor in tokens.
     {
-      mode: 2,
-      flags: 0x00,
+      mode: SENDER,
+      flags: 0,
+      target: feeToken,
+      limits: { execution: 60_000n, state: 25_000n },
+      value: 0n,
+      data: encodeFunctionData({
+        abi: erc20Abi,
+        functionName: 'transfer',
+        args: [paymaster, maxTokenFee],
+      }),
+    },
+
+    // Frame 3 -- SENDER: the user's actual intent, runs as tx.sender.
+    {
+      mode: SENDER,
+      flags: 0,
       target: targetContract,
-      gasLimit: 100_000n,
+      limits: { execution: 100_000n, state: 25_000n },
       value: 0n,
       data: encodeFunctionData({
         abi: storageAbi,
@@ -113,26 +153,24 @@ const tx: TransactionSerializableEIP8141 = {
       }),
     },
 
-    // Frame 2 -- DEFAULT: paymaster logic at the entry point.
-    // Executes as address 0xaa, calling the paymaster contract to
-    // debit the sponsor's pre-funded balance instead of the sender's.
+    // Frame 4 -- DEFAULT: paymaster post-op at the entry point (0xaa).
     {
-      mode: 0,
-      flags: 0x00,
+      mode: DEFAULT,
+      flags: 0,
       target: paymaster,
-      gasLimit: 80_000n,
+      limits: { execution: 80_000n, state: 25_000n },
       value: 0n,
       data: encodeFunctionData({
         abi: paymasterAbi,
-        functionName: 'sponsorGas',
-        args: [paymaster, sender],
+        functionName: 'postOp',
+        args: [account.address],
       }),
     },
   ],
 }
 
 async function main() {
-  const serialized = serializeTransaction(tx)
+  const serialized = await account.signTransaction(tx)
   console.log(
     'Serialized sponsored EIP-8141 tx:',
     serialized.slice(0, 66),
@@ -140,17 +178,18 @@ async function main() {
   )
   console.log('Type byte: 0x06 (EIP-8141)')
   console.log('Frames:', tx.frames.length)
-  console.log('  [0] VERIFY   - validator approves')
-  console.log('  [1] SENDER   - store(42) on target contract')
-  console.log('  [2] DEFAULT  - paymaster sponsors gas')
+  console.log('  [0] VERIFY   - default code approves execution')
+  console.log('  [1] VERIFY   - paymaster approves payment')
+  console.log('  [2] SENDER   - pay the paymaster in tokens')
+  console.log('  [3] SENDER   - store(42) on target contract')
+  console.log('  [4] DEFAULT  - paymaster post-op')
   console.log()
 
   const client = createClient({ transport: http(RPC_URL) })
 
   console.log('Sending to', RPC_URL, `(chainId ${CHAIN_ID}) ...`)
-  const hash = await client.request({
-    method: 'eth_sendRawTransaction' as any,
-    params: [serialized as Hex],
+  const hash = await sendRawTransaction(client, {
+    serializedTransaction: serialized,
   })
   console.log('Transaction hash:', hash)
 }

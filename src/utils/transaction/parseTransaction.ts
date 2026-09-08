@@ -17,6 +17,7 @@ import type { Hex, Signature } from '../../types/misc.js'
 import type {
   AccessList,
   Frame,
+  FrameSignature,
   TransactionRequestEIP2930,
   TransactionRequestLegacy,
   TransactionSerializable,
@@ -150,38 +151,43 @@ function parseTransactionEIP8141(
     nonce,
     sender,
     framesArray,
-    maxPriorityFeePerGas,
-    maxFeePerGas,
-    maxFeePerBlobGas,
+    signaturesArray,
+    fees,
     blobVersionedHashes,
   ] = transactionArray
 
-  if (transactionArray.length !== 8)
+  if (
+    transactionArray.length !== 7 ||
+    !Array.isArray(fees) ||
+    fees.length !== 3
+  )
     throw new InvalidSerializedTransactionError({
       attributes: {
         chainId,
         nonce,
         sender,
         frames: framesArray,
-        maxPriorityFeePerGas,
-        maxFeePerGas,
-        maxFeePerBlobGas,
+        signatures: signaturesArray,
+        fees,
         blobVersionedHashes,
       },
       serializedTransaction,
       type: 'eip8141',
     })
 
+  const [maxPriorityFeePerGas, maxFeePerGas, maxFeePerBlobGas] = fees as Hex[]
+
   const frames: Frame[] = (framesArray as RecursiveArray<Hex>[]).map(
     (frameArray) => {
-      const tuple = frameArray as Hex[]
-      if (tuple.length !== 6)
+      const tuple = frameArray as RecursiveArray<Hex>[]
+      const limits = tuple[3] as Hex[]
+      if (tuple.length !== 6 || !Array.isArray(limits) || limits.length !== 2)
         throw new InvalidSerializedTransactionError({
           attributes: { frame: tuple },
           serializedTransaction,
           type: 'eip8141',
         })
-      const [mode, flags, target, gasLimit, value, data] = tuple
+      const [mode, flags, target, , value, data] = tuple as Hex[]
       const parsedMode = mode === '0x' ? 0 : hexToNumber(mode)
       if (parsedMode > 2)
         throw new InvalidSerializedTransactionError({
@@ -193,12 +199,36 @@ function parseTransactionEIP8141(
         mode: parsedMode as Frame['mode'],
         flags: flags === '0x' ? 0 : hexToNumber(flags),
         target: isHex(target) && target !== '0x' ? getAddress(target) : null,
-        gasLimit: gasLimit === '0x' ? 0n : hexToBigInt(gasLimit),
+        limits: {
+          execution: limits[0] === '0x' ? 0n : hexToBigInt(limits[0]),
+          state: limits[1] === '0x' ? 0n : hexToBigInt(limits[1]),
+        },
         value: value === '0x' ? 0n : hexToBigInt(value),
         data: isHex(data) && data !== '0x' ? data : '0x',
       }
     },
   )
+
+  const signatures: FrameSignature[] = (
+    signaturesArray as RecursiveArray<Hex>[]
+  ).map((signatureArray) => {
+    const tuple = signatureArray as Hex[]
+    if (tuple.length !== 4)
+      throw new InvalidSerializedTransactionError({
+        attributes: { signature: tuple },
+        serializedTransaction,
+        type: 'eip8141',
+      })
+    const [scheme, signer, msg, signature] = tuple
+    return {
+      scheme: (scheme === '0x'
+        ? 0
+        : hexToNumber(scheme)) as FrameSignature['scheme'],
+      signer: isHex(signer) && signer !== '0x' ? getAddress(signer) : null,
+      msg: isHex(msg) && msg !== '0x' ? msg : '0x',
+      signature: isHex(signature) && signature !== '0x' ? signature : '0x',
+    }
+  })
 
   const transaction: TransactionSerializableEIP8141 = {
     chainId: hexToNumber(chainId as Hex),
@@ -206,6 +236,8 @@ function parseTransactionEIP8141(
     frames,
     type: 'eip8141',
   }
+
+  if (signatures.length > 0) transaction.signatures = signatures
 
   if (isHex(nonce)) {
     if (nonce === '0x') {

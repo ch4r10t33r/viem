@@ -128,7 +128,15 @@ describe('attributes', () => {
 
   test('eip8141 (frames property)', () => {
     const type = getTransactionType({
-      frames: [{ mode: 1, flags: 3, target: null, gasLimit: 1n, data: '0x' }],
+      frames: [
+        {
+          mode: 1,
+          flags: 3,
+          target: null,
+          limits: { execution: 1n, state: 0n },
+          data: '0x',
+        },
+      ],
       sender: '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266',
       chainId: 1,
     } as any)

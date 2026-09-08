@@ -3,6 +3,8 @@ import { BaseError, type BaseErrorType } from '../../errors/base.js'
 import type { ErrorType } from '../../errors/utils.js'
 import type { ByteArray, Hex, Signature } from '../../types/misc.js'
 import type { TransactionSerialized } from '../../types/transaction.js'
+import { slice } from '../data/slice.js'
+import { hexToNumber } from '../encoding/fromHex.js'
 import { type Keccak256ErrorType, keccak256 } from '../hash/keccak256.js'
 import { parseTransaction } from '../transaction/parseTransaction.js'
 import {
@@ -37,15 +39,42 @@ export async function recoverTransactionAddress(
 
   const transaction = parseTransaction(serializedTransaction)
 
+  // EIP-8141: recover the sender's `SECP256K1` signature (no explicit `signer`)
+  // over the canonical signature hash, which elides the `signature` bytes of
+  // every entry with an empty `msg`.
   if ('frames' in transaction) {
-    if (!signature_)
-      throw new BaseError(
-        'EIP-8141 transactions require an explicit `signature` to recover an address.',
+    const signature = (() => {
+      if (signature_) return signature_
+      const entry = transaction.signatures?.find(
+        (signature) =>
+          signature.scheme === 1 &&
+          signature.signer === null &&
+          signature.msg === '0x' &&
+          signature.signature !== '0x',
       )
+      if (!entry)
+        throw new BaseError(
+          'EIP-8141 transactions require a `SECP256K1` signature by `sender` over the transaction hash (or an explicit `signature`) to recover an address.',
+        )
+      return {
+        yParity: hexToNumber(slice(entry.signature, 0, 1)),
+        r: slice(entry.signature, 1, 33),
+        s: slice(entry.signature, 33, 65),
+      }
+    })()
 
     return await recoverAddress({
-      hash: keccak256(serializeTransaction(transaction)),
-      signature: signature_,
+      hash: keccak256(
+        serializeTransaction({
+          ...transaction,
+          signatures: transaction.signatures?.map((signature) =>
+            signature.msg === '0x'
+              ? { ...signature, signature: '0x' as const }
+              : signature,
+          ),
+        }),
+      ),
+      signature,
     })
   }
 

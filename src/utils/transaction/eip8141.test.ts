@@ -1,94 +1,197 @@
 import { describe, expect, test } from 'vitest'
-import { maxUint256 } from '../../constants/number.js'
+import { accounts } from '~test/constants.js'
+import { signTransaction } from '../../accounts/utils/signTransaction.js'
 import type {
+  FrameSignature,
   TransactionSerializableEIP8141,
   TransactionSerializedEIP8141,
 } from '../../types/transaction.js'
 import { getAddress } from '../address/getAddress.js'
+import { concatHex } from '../data/concat.js'
 import { fromRlp } from '../encoding/fromRlp.js'
 import { numberToHex } from '../encoding/toHex.js'
 import { toRlp } from '../encoding/toRlp.js'
+import { keccak256 } from '../hash/keccak256.js'
+import { recoverTransactionAddress } from '../signature/recoverTransactionAddress.js'
 import { parseGwei } from '../unit/parseGwei.js'
 import { assertTransactionEIP8141 } from './assertTransaction.js'
 import { getSerializedTransactionType } from './getSerializedTransactionType.js'
 import { getTransactionType } from './getTransactionType.js'
 import { parseTransaction } from './parseTransaction.js'
-import { serializeTransaction } from './serializeTransaction.js'
+import {
+  attachSignatureEIP8141,
+  serializeTransaction,
+} from './serializeTransaction.js'
 
-const sender = '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266' as const
+const sender = accounts[0].address
+const recipient = getAddress('0x70997970c51812dc3a010c7d01b50e0d17dc79c8')
+
+const DEFAULT = 0
+const VERIFY = 1
+const SENDER = 2
+const APPROVE_PAYMENT = 0x01
+const APPROVE_EXECUTION = 0x02
+const APPROVE_EXECUTION_AND_PAYMENT = 0x03
+const ATOMIC_BATCH_FLAG = 0x04
+
+const verifyFrame = {
+  mode: VERIFY,
+  flags: APPROVE_EXECUTION_AND_PAYMENT,
+  target: null,
+  limits: { execution: 50_000n, state: 0n },
+  value: 0n,
+  data: '0x',
+} as const
+
+const senderFrame = {
+  mode: SENDER,
+  flags: 0,
+  target: recipient,
+  limits: { execution: 100_000n, state: 10_000n },
+  value: 0n,
+  data: '0xcafebabe',
+} as const
 
 const baseEIP8141: TransactionSerializableEIP8141 = {
   chainId: 1,
   nonce: 0,
   sender,
-  frames: [
-    {
-      mode: 1,
-      flags: 0x03,
-      target: null,
-      gasLimit: 50000n,
-      value: 0n,
-      data: '0xdeadbeef',
-    },
-    {
-      mode: 2,
-      flags: 0x00,
-      target: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8',
-      gasLimit: 100000n,
-      value: 0n,
-      data: '0xcafebabe',
-    },
-  ],
+  frames: [verifyFrame, senderFrame],
   maxPriorityFeePerGas: parseGwei('1'),
   maxFeePerGas: parseGwei('10'),
-  maxFeePerBlobGas: 0n,
-  blobVersionedHashes: [],
+}
+
+/** Reference implementation of the EIP-8141 payload / `compute_sig_hash`. */
+function referenceSigHash(tx: TransactionSerializableEIP8141) {
+  const quantity = (value: bigint | number | undefined) =>
+    value ? numberToHex(value) : '0x'
+  return keccak256(
+    concatHex([
+      '0x06',
+      toRlp([
+        quantity(tx.chainId),
+        quantity(tx.nonce),
+        tx.sender,
+        tx.frames.map((frame) => [
+          quantity(frame.mode),
+          quantity(frame.flags),
+          frame.target ?? '0x',
+          [quantity(frame.limits.execution), quantity(frame.limits.state)],
+          quantity(frame.value),
+          frame.data,
+        ]),
+        (tx.signatures ?? []).map((signature) => [
+          quantity(signature.scheme),
+          signature.signer ?? '0x',
+          signature.msg,
+          signature.msg === '0x' ? '0x' : signature.signature,
+        ]),
+        [
+          quantity(tx.maxPriorityFeePerGas),
+          quantity(tx.maxFeePerGas),
+          quantity(tx.maxFeePerBlobGas),
+        ],
+        tx.blobVersionedHashes ?? [],
+      ]),
+    ]),
+  )
 }
 
 describe('eip8141 serialization', () => {
-  test('roundtrip: SENDER frame value preserved', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
+  test('payload layout: [chain_id, nonce, sender, frames, signatures, fees, blob_versioned_hashes]', () => {
+    const serialized = serializeTransaction(baseEIP8141)
+    expect(serialized.slice(0, 4)).toBe('0x06')
+
+    const payload = fromRlp(`0x${serialized.slice(4)}`, 'hex')
+    expect(payload).toEqual([
+      '0x01',
+      '0x',
       sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 21000n,
-          value: 0n,
-          data: '0x',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8',
-          gasLimit: 21000n,
-          value: 1234567890123456789n,
-          data: '0x',
-        },
+      [
+        ['0x01', '0x03', '0x', ['0xc350', '0x'], '0x', '0x'],
+        [
+          '0x02',
+          '0x',
+          recipient.toLowerCase(),
+          ['0x0186a0', '0x2710'],
+          '0x',
+          '0xcafebabe',
+        ],
       ],
-    }
-    const parsed = parseTransaction(serializeTransaction(tx))
-    expect(parsed.frames[1].value).toBe(1234567890123456789n)
+      [],
+      ['0x3b9aca00', '0x02540be400', '0x'],
+      [],
+    ])
+  })
+
+  test('signature entries are encoded as [scheme, signer, msg, signature]', () => {
+    const digest = `0x${'11'.repeat(32)}` as const
+    const serialized = serializeTransaction({
+      ...baseEIP8141,
+      signatures: [
+        { scheme: 1, signer: null, msg: '0x', signature: '0x' },
+        {
+          scheme: 2,
+          signer: recipient,
+          msg: digest,
+          signature: `0x${'22'.repeat(128)}`,
+        },
+        { scheme: 0, signer: null, msg: '0x', signature: '0xdeadbeef' },
+      ],
+    })
+    const payload = fromRlp(`0x${serialized.slice(4)}`, 'hex')
+    expect(payload[4]).toEqual([
+      ['0x01', '0x', '0x', '0x'],
+      ['0x02', recipient.toLowerCase(), digest, `0x${'22'.repeat(128)}`],
+      ['0x', '0x', '0x', '0xdeadbeef'],
+    ])
   })
 
   test('roundtrip: serialize then parse', () => {
     const serialized = serializeTransaction(baseEIP8141)
-    expect(serialized.startsWith('0x06')).toBe(true)
-    const parsed = parseTransaction(serialized)
-    const {
-      maxFeePerBlobGas: _,
-      blobVersionedHashes: __,
-      ...expected
-    } = baseEIP8141
-    expect(parsed).toEqual({
-      ...expected,
+    expect(parseTransaction(serialized)).toEqual({
+      ...baseEIP8141,
       type: 'eip8141',
-      frames: expected.frames.map((f) => ({
-        ...f,
-        target: f.target ? getAddress(f.target) : null,
-      })),
+    })
+  })
+
+  test('roundtrip: signatures, blobs and all frame modes', () => {
+    const tx: TransactionSerializableEIP8141 = {
+      ...baseEIP8141,
+      nonce: 7,
+      frames: [
+        {
+          mode: DEFAULT,
+          flags: 0,
+          target: recipient,
+          limits: { execution: 30_000n, state: 5_000n },
+          value: 0n,
+          data: '0x1234',
+        },
+        verifyFrame,
+        { ...senderFrame, value: 1_000_000n },
+      ],
+      signatures: [
+        {
+          scheme: 1,
+          signer: null,
+          msg: '0x',
+          signature: `0x00${'ab'.repeat(64)}`,
+        },
+        {
+          scheme: 2,
+          signer: recipient,
+          msg: `0x${'11'.repeat(32)}`,
+          signature: `0x${'22'.repeat(128)}`,
+        },
+        { scheme: 0, signer: null, msg: '0x', signature: '0xdeadbeef' },
+      ],
+      maxFeePerBlobGas: parseGwei('2'),
+      blobVersionedHashes: [`0x01${'00'.repeat(31)}`],
+    }
+    expect(parseTransaction(serializeTransaction(tx))).toEqual({
+      ...tx,
+      type: 'eip8141',
     })
   })
 
@@ -96,195 +199,189 @@ describe('eip8141 serialization', () => {
     const tx: TransactionSerializableEIP8141 = {
       chainId: 1,
       sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 21000n,
-          value: 0n,
-          data: '0x00',
-        },
-      ],
+      frames: [verifyFrame],
     }
     const serialized = serializeTransaction(tx)
-    expect(serialized.startsWith('0x06')).toBe(true)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.chainId).toBe(1)
-    expect(parsed.sender).toBe(sender)
-    expect(parsed.frames).toHaveLength(1)
-    expect(parsed.frames[0].mode).toBe(1)
-    expect(parsed.frames[0].flags).toBe(0x03)
-    expect(parsed.frames[0].target).toBeNull()
-    expect(parsed.frames[0].gasLimit).toBe(21000n)
-  })
-
-  test('preserves flags field through roundtrip', () => {
-    const tx: TransactionSerializableEIP8141 = {
+    expect(parseTransaction(serialized)).toEqual({
       chainId: 1,
+      nonce: 0,
       sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x01,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xab',
-        },
-        {
-          mode: 1,
-          flags: 0x02,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xcd',
-        },
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xef',
-        },
-      ],
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].flags).toBe(0x01)
-    expect(parsed.frames[1].flags).toBe(0x02)
-    expect(parsed.frames[2].flags).toBe(0x03)
+      frames: [verifyFrame],
+      type: 'eip8141',
+    })
   })
 
-  test('atomic batch flag roundtrip', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xaa',
-        },
-        {
-          mode: 2,
-          flags: 0x04,
-          target: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8',
-          gasLimit: 100000n,
-          value: 0n,
-          data: '0xbb',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8',
-          gasLimit: 100000n,
-          value: 0n,
-          data: '0xcc',
-        },
-      ],
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[1].flags).toBe(0x04)
-    expect(parsed.frames[2].flags).toBe(0x00)
-  })
-
-  test('all three modes', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      sender,
-      frames: [
-        {
-          mode: 0,
-          flags: 0x00,
-          target: sender,
-          gasLimit: 10000n,
-          value: 0n,
-          data: '0x',
-        },
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xdeadbeef',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8',
-          gasLimit: 100000n,
-          value: 0n,
-          data: '0xcafebabe',
-        },
-      ],
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].mode).toBe(0)
-    expect(parsed.frames[1].mode).toBe(1)
-    expect(parsed.frames[2].mode).toBe(2)
-  })
-
-  test('fee fields preserved', () => {
+  test('null target is serialized as empty bytes', () => {
     const serialized = serializeTransaction(baseEIP8141)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.maxPriorityFeePerGas).toBe(parseGwei('1'))
-    expect(parsed.maxFeePerGas).toBe(parseGwei('10'))
+    const payload = fromRlp(`0x${serialized.slice(4)}`, 'hex') as any
+    expect(payload[3][0][2]).toBe('0x')
+    expect(parseTransaction(serialized).frames[0].target).toBeNull()
   })
 
-  test('blob fields preserved when present', () => {
-    const tx: TransactionSerializableEIP8141 = {
+  test('serialized type byte is 0x06', () => {
+    expect(serializeTransaction(baseEIP8141).startsWith('0x06')).toBe(true)
+  })
+})
+
+describe('eip8141 signing', () => {
+  test('signature hash elides signature bytes of entries with empty msg', async () => {
+    const serialized = await signTransaction({
+      privateKey: accounts[0].privateKey,
+      transaction: baseEIP8141,
+    })
+    const signed = parseTransaction(serialized)
+    expect(signed.signatures).toHaveLength(1)
+    const [signature] = signed.signatures!
+    expect(signature.scheme).toBe(1)
+    expect(signature.signer).toBeNull()
+    expect(signature.msg).toBe('0x')
+    // v (1 byte) || r (32 bytes) || s (32 bytes)
+    expect(signature.signature).toHaveLength(2 + 65 * 2)
+    expect(['0x00', '0x01']).toContain(signature.signature.slice(0, 4))
+
+    expect(
+      await recoverTransactionAddress({
+        serializedTransaction: serialized,
+      }),
+    ).toBe(getAddress(sender))
+  })
+
+  test('signature hash matches the EIP-8141 reference implementation', async () => {
+    const serialized = await signTransaction({
+      privateKey: accounts[0].privateKey,
+      transaction: baseEIP8141,
+    })
+    const signed = parseTransaction(serialized)
+    const [signature] = signed.signatures!
+    expect(
+      await recoverTransactionAddress({
+        serializedTransaction: serialized,
+        signature: {
+          yParity: Number(signature.signature.slice(2, 4)),
+          r: `0x${signature.signature.slice(4, 68)}`,
+          s: `0x${signature.signature.slice(68, 132)}`,
+        },
+      }),
+    ).toBe(getAddress(sender))
+    // The unsigned transaction (empty signature slot) hashes to the same value.
+    expect(referenceSigHash(signed)).toBe(
+      keccak256(
+        serializeTransaction({
+          ...signed,
+          signatures: [{ ...signature, signature: '0x' }],
+        }),
+      ),
+    )
+  })
+
+  test('fills the first unsigned SECP256K1 slot and keeps other entries', async () => {
+    const other: FrameSignature = {
+      scheme: 1,
+      signer: recipient,
+      msg: '0x',
+      signature: `0x01${'ab'.repeat(64)}`,
+    }
+    const transaction: TransactionSerializableEIP8141 = {
       ...baseEIP8141,
-      maxFeePerBlobGas: 1000n,
-      blobVersionedHashes: [
-        '0x01febabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe',
+      signatures: [
+        other,
+        { scheme: 1, signer: null, msg: '0x', signature: '0x' },
       ],
     }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.maxFeePerBlobGas).toBe(1000n)
-    expect(parsed.blobVersionedHashes).toEqual([
-      '0x01febabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe',
+    const serialized = await signTransaction({
+      privateKey: accounts[0].privateKey,
+      transaction,
+    })
+    const signed = parseTransaction(serialized)
+    expect(signed.signatures).toHaveLength(2)
+    expect(signed.signatures![0]).toEqual(other)
+    expect(signed.signatures![1].signature).not.toBe('0x')
+
+    // The hash committed to elides both empty-msg entries' bytes.
+    expect(
+      await recoverTransactionAddress({ serializedTransaction: serialized }),
+    ).toBe(getAddress(sender))
+    expect(referenceSigHash(signed)).toBe(
+      keccak256(
+        serializeTransaction({
+          ...signed,
+          signatures: signed.signatures!.map((signature) => ({
+            ...signature,
+            signature: '0x' as const,
+          })),
+        }),
+      ),
+    )
+  })
+
+  test('attachSignatureEIP8141 appends a slot when none exists', () => {
+    expect(attachSignatureEIP8141(undefined)).toEqual([
+      { scheme: 1, signer: null, msg: '0x', signature: '0x' },
+    ])
+    expect(
+      attachSignatureEIP8141(undefined, {
+        r: `0x${'01'.repeat(32)}`,
+        s: `0x${'02'.repeat(32)}`,
+        yParity: 1,
+      }),
+    ).toEqual([
+      {
+        scheme: 1,
+        signer: null,
+        msg: '0x',
+        signature: `0x01${'01'.repeat(32)}${'02'.repeat(32)}`,
+      },
     ])
   })
 
-  test('nonce field preserved', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      ...baseEIP8141,
-      nonce: 42,
+  test('attachSignatureEIP8141 skips slots with an explicit signer', () => {
+    const sponsorSlot: FrameSignature = {
+      scheme: 1,
+      signer: recipient,
+      msg: '0x',
+      signature: '0x',
     }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.nonce).toBe(42)
+    expect(attachSignatureEIP8141([sponsorSlot])).toEqual([
+      sponsorSlot,
+      { scheme: 1, signer: null, msg: '0x', signature: '0x' },
+    ])
+  })
+
+  test('attachSignatureEIP8141 derives yParity from v', () => {
+    const [signature] = attachSignatureEIP8141([], {
+      r: `0x${'01'.repeat(32)}`,
+      s: `0x${'02'.repeat(32)}`,
+      v: 27n,
+    })
+    expect(signature.signature.slice(0, 4)).toBe('0x00')
+  })
+
+  test('recoverTransactionAddress rejects unsigned transactions', async () => {
+    await expect(() =>
+      recoverTransactionAddress({
+        serializedTransaction: serializeTransaction(baseEIP8141),
+      }),
+    ).rejects.toThrow('EIP-8141 transactions require a `SECP256K1` signature')
   })
 })
 
 describe('eip8141 getTransactionType', () => {
   test('infers eip8141 from frames property', () => {
-    expect(
-      getTransactionType({
-        frames: baseEIP8141.frames,
-        sender,
-        chainId: 1,
-      } as any),
-    ).toBe('eip8141')
+    expect(getTransactionType(baseEIP8141)).toBe('eip8141')
   })
 
   test('infers eip8141 from explicit type', () => {
-    expect(getTransactionType({ type: 'eip8141' } as any)).toBe('eip8141')
+    expect(getTransactionType({ ...baseEIP8141, type: 'eip8141' })).toBe(
+      'eip8141',
+    )
   })
 })
 
 describe('eip8141 getSerializedTransactionType', () => {
   test('identifies 0x06 prefix as eip8141', () => {
-    expect(getSerializedTransactionType('0x06abc')).toBe('eip8141')
+    expect(
+      getSerializedTransactionType(serializeTransaction(baseEIP8141)),
+    ).toBe('eip8141')
   })
 })
 
@@ -296,42 +393,23 @@ describe('eip8141 assertTransaction', () => {
   test('invalid chainId', () => {
     expect(() =>
       assertTransactionEIP8141({ ...baseEIP8141, chainId: 0 }),
-    ).toThrow('Chain ID')
+    ).toThrow('Chain ID "0" is invalid.')
   })
 
   test('invalid sender address', () => {
     expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        sender: '0xinvalid' as any,
-      }),
-    ).toThrow('invalid')
-  })
-
-  test('zero-address sender rejected', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        sender: '0x0000000000000000000000000000000000000000',
-      }),
-    ).toThrow('zero address')
+      assertTransactionEIP8141({ ...baseEIP8141, sender: '0xinvalid' as any }),
+    ).toThrow('Address "0xinvalid" is invalid.')
   })
 
   test('empty frames', () => {
     expect(() =>
       assertTransactionEIP8141({ ...baseEIP8141, frames: [] }),
-    ).toThrow('at least one frame')
+    ).toThrow('`frames` must contain at least one frame.')
   })
 
   test('exceeds MAX_FRAMES (64)', () => {
-    const frames = Array.from({ length: 65 }, () => ({
-      mode: 0 as const,
-      flags: 0,
-      target: sender,
-      gasLimit: 1n,
-      value: 0n,
-      data: '0x' as const,
-    }))
+    const frames = Array.from({ length: 65 }, () => senderFrame)
     expect(() => assertTransactionEIP8141({ ...baseEIP8141, frames })).toThrow(
       'MAX_FRAMES (64)',
     )
@@ -339,12 +417,8 @@ describe('eip8141 assertTransaction', () => {
 
   test('exactly MAX_FRAMES (64) passes', () => {
     const frames = Array.from({ length: 64 }, () => ({
-      mode: 0 as const,
-      flags: 0,
-      target: sender,
-      gasLimit: 1n,
-      value: 0n,
-      data: '0x' as const,
+      ...senderFrame,
+      limits: { execution: 1_000n, state: 0n },
     }))
     expect(() =>
       assertTransactionEIP8141({ ...baseEIP8141, frames }),
@@ -355,794 +429,542 @@ describe('eip8141 assertTransaction', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
-        frames: [
-          {
-            mode: 3 as any,
-            flags: 0,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
+        frames: [{ ...senderFrame, mode: 3 as any }],
       }),
-    ).toThrow('Invalid frame mode')
+    ).toThrow('Invalid frame mode 3')
   })
 
-  test('invalid frame flags (>=8, reserved bits set)', () => {
+  test('reserved flag bits rejected', () => {
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [{ ...senderFrame, flags: 0x08 }],
+      }),
+    ).toThrow('Bits 3 and above are reserved')
+  })
+
+  test('VERIFY frame with zero APPROVE scope is allowed (e.g. expiry verifier)', () => {
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [{ ...verifyFrame, flags: 0 }, verifyFrame, senderFrame],
+      }),
+    ).not.toThrow()
+  })
+
+  test('non-SENDER frame with value rejected', () => {
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [{ ...verifyFrame, value: 1n }, senderFrame],
+      }),
+    ).toThrow('`frame.value` must be 0 for DEFAULT and VERIFY frames')
+  })
+
+  test('APPROVE_EXECUTION scope must target sender or null', () => {
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [{ ...verifyFrame, target: recipient }, senderFrame],
+      }),
+    ).toThrow('APPROVE_EXECUTION')
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [{ ...verifyFrame, target: sender }, senderFrame],
+      }),
+    ).not.toThrow()
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
         frames: [
-          {
-            mode: 2,
-            flags: 8,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
-      }),
-    ).toThrow('Bits 3-7 are reserved')
-  })
-
-  test('flags=0xff rejected', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        frames: [
-          {
-            mode: 2,
-            flags: 0xff,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
-      }),
-    ).toThrow('Bits 3-7 are reserved')
-  })
-
-  test('VERIFY frame with zero APPROVE scope rejected', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        frames: [
-          {
-            mode: 1,
-            flags: 0x00,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
-      }),
-    ).toThrow('non-zero APPROVE scope')
-  })
-
-  test('VERIFY frame with APPROVE_PAYMENT (0x01) passes', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        frames: [
-          {
-            mode: 1,
-            flags: 0x01,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
+          { ...verifyFrame, flags: APPROVE_PAYMENT, target: recipient },
+          senderFrame,
         ],
       }),
     ).not.toThrow()
   })
 
-  test('VERIFY frame with APPROVE_EXECUTION (0x02) passes', () => {
+  test('atomic batch flag on VERIFY frame rejected', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
-        frames: [
-          {
-            mode: 1,
-            flags: 0x02,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
+        frames: [{ ...verifyFrame, flags: ATOMIC_BATCH_FLAG }, senderFrame],
       }),
-    ).not.toThrow()
-  })
-
-  test('VERIFY frame with APPROVE_PAYMENT_AND_EXECUTION (0x03) passes', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        frames: [
-          {
-            mode: 1,
-            flags: 0x03,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
-      }),
-    ).not.toThrow()
-  })
-
-  test('atomic batch flag on non-SENDER mode rejected', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        frames: [
-          {
-            mode: 0,
-            flags: 0x04,
-            target: sender,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-          {
-            mode: 2,
-            flags: 0x00,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
-      }),
-    ).toThrow('only valid with SENDER mode')
+    ).toThrow('not valid with VERIFY mode')
   })
 
   test('atomic batch flag on last frame rejected', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
-        frames: [
-          {
-            mode: 1,
-            flags: 0x03,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-          {
-            mode: 2,
-            flags: 0x04,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
+        frames: [verifyFrame, { ...senderFrame, flags: ATOMIC_BATCH_FLAG }],
       }),
     ).toThrow('must not be the last frame')
   })
 
-  test('atomic batch flag: next frame must be SENDER', () => {
+  test('atomic batch flag: next frame must not be VERIFY', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
         frames: [
-          {
-            mode: 1,
-            flags: 0x03,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-          {
-            mode: 2,
-            flags: 0x04,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-          {
-            mode: 0,
-            flags: 0x00,
-            target: sender,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
+          verifyFrame,
+          { ...senderFrame, flags: ATOMIC_BATCH_FLAG },
+          verifyFrame,
+          senderFrame,
         ],
       }),
-    ).toThrow('following an atomic batch frame must be SENDER')
+    ).toThrow('must not be VERIFY mode')
   })
 
-  test('valid atomic batch: SENDER frames with flag set then unset', () => {
+  test('atomic batch is allowed on DEFAULT and SENDER frames', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
         frames: [
-          {
-            mode: 1,
-            flags: 0x03,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-          {
-            mode: 2,
-            flags: 0x04,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-          {
-            mode: 2,
-            flags: 0x00,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
+          verifyFrame,
+          { ...senderFrame, mode: DEFAULT, flags: ATOMIC_BATCH_FLAG },
+          { ...senderFrame, flags: ATOMIC_BATCH_FLAG },
+          senderFrame,
         ],
       }),
     ).not.toThrow()
   })
 
-  test('frame gas_limit > 2^63-1 rejected', () => {
+  test('frames in an atomic batch must not permit an APPROVE scope', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
         frames: [
-          {
-            mode: 1,
-            flags: 0x03,
-            target: null,
-            gasLimit: 2n ** 63n,
-            value: 0n,
-            data: '0x',
-          },
+          verifyFrame,
+          { ...senderFrame, flags: ATOMIC_BATCH_FLAG | APPROVE_PAYMENT },
+          senderFrame,
         ],
       }),
-    ).toThrow('gasLimit` must be <= 2^63 - 1')
-  })
-
-  test('frame gas_limit at 2^63-1 passes', () => {
+    ).toThrow('atomic batch must not permit an APPROVE scope')
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
         frames: [
-          {
-            mode: 1,
-            flags: 0x03,
-            target: null,
-            gasLimit: 2n ** 63n - 1n,
-            value: 0n,
-            data: '0x',
-          },
+          verifyFrame,
+          { ...senderFrame, flags: ATOMIC_BATCH_FLAG },
+          { ...senderFrame, flags: APPROVE_PAYMENT },
+        ],
+      }),
+    ).toThrow('atomic batch must not permit an APPROVE scope')
+  })
+
+  test('total frame gas (execution + state) must be < 2^64', () => {
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [
+          { ...senderFrame, limits: { execution: 2n ** 63n, state: 0n } },
+          { ...senderFrame, limits: { execution: 2n ** 63n, state: 0n } },
+        ],
+      }),
+    ).toThrow('must be less than 2^64')
+  })
+
+  test('intrinsic + execution gas must fit the EIP-7825 cap', () => {
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [
+          verifyFrame,
+          { ...senderFrame, limits: { execution: 16_777_216n, state: 0n } },
+        ],
+      }),
+    ).toThrow('EIP-7825 transaction gas cap')
+    // State gas does not count towards the execution cap.
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [
+          verifyFrame,
+          { ...senderFrame, limits: { execution: 100n, state: 16_777_216n } },
         ],
       }),
     ).not.toThrow()
-  })
-
-  test('total frame gas > 2^63-1 rejected', () => {
-    const gasPerFrame = 2n ** 63n - 1n
+    // Calldata floor: 65 kB of data costs 16 * 4 gas per byte.
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
         frames: [
-          {
-            mode: 1,
-            flags: 0x03,
-            target: null,
-            gasLimit: gasPerFrame,
-            data: '0x',
-          },
-          {
-            mode: 2,
-            flags: 0x00,
-            target: null,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
+          verifyFrame,
+          { ...senderFrame, data: `0x${'00'.repeat(262_144)}` },
         ],
       }),
-    ).toThrow('Total frame gas must be <= 2^63 - 1')
+    ).toThrow('EIP-7825 transaction gas cap')
+  })
+
+  test('expiry verifier frame constraints', () => {
+    const expiryFrame = {
+      mode: VERIFY,
+      flags: 0,
+      target: '0x0000000000000000000000000000000000008141',
+      limits: { execution: 10_000n, state: 0n },
+      value: 0n,
+      data: '0x0000000068000000',
+    } as const
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [expiryFrame, verifyFrame, senderFrame],
+      }),
+    ).not.toThrow()
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [{ ...expiryFrame, data: '0x00' }, verifyFrame, senderFrame],
+      }),
+    ).toThrow('Expiry verifier frames')
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [
+          { ...expiryFrame, limits: { execution: 10_000n, state: 1n } },
+          verifyFrame,
+          senderFrame,
+        ],
+      }),
+    ).toThrow('Expiry verifier frames')
+    expect(() =>
+      assertTransactionEIP8141({
+        ...baseEIP8141,
+        frames: [
+          { ...expiryFrame, flags: APPROVE_PAYMENT },
+          verifyFrame,
+          senderFrame,
+        ],
+      }),
+    ).toThrow('Expiry verifier frames')
   })
 
   test('invalid frame target address', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
-        frames: [
-          {
-            mode: 1,
-            flags: 0x03,
-            target: '0xbad' as any,
-            gasLimit: 1n,
-            value: 0n,
-            data: '0x',
-          },
-        ],
+        frames: [verifyFrame, { ...senderFrame, target: '0xnope' as any }],
       }),
-    ).toThrow('invalid')
+    ).toThrow('Address "0xnope" is invalid.')
   })
 
   test('fee cap too high', () => {
     expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        maxFeePerGas: maxUint256 + 1n,
-      }),
-    ).toThrow()
+      assertTransactionEIP8141({ ...baseEIP8141, maxFeePerGas: 2n ** 256n }),
+    ).toThrow('The fee cap')
   })
 
   test('tip above fee cap', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
-        maxFeePerGas: parseGwei('1'),
-        maxPriorityFeePerGas: parseGwei('2'),
+        maxFeePerGas: 1n,
+        maxPriorityFeePerGas: 2n,
       }),
-    ).toThrow()
+    ).toThrow('The provided tip')
   })
 })
 
-describe('eip8141 spec examples', () => {
-  test('Example 1: Simple Transaction (self-verify + sender)', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      nonce: 0,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefde',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8',
-          gasLimit: 100000n,
-          value: 0n,
-          data: '0xcafebabe',
-        },
-      ],
-      maxPriorityFeePerGas: parseGwei('1'),
-      maxFeePerGas: parseGwei('10'),
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].mode).toBe(1)
-    expect(parsed.frames[0].flags).toBe(0x03)
-    expect(parsed.frames[1].mode).toBe(2)
-    expect(parsed.frames[1].flags).toBe(0x00)
+describe('eip8141 signature constraints', () => {
+  const withSignature = (signature: FrameSignature) => ({
+    ...baseEIP8141,
+    signatures: [signature],
   })
 
-  test('Example 2: Atomic Approve + Swap (verify + 2 SENDER atomic batch)', () => {
-    const erc20 = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' as const
-    const dex = '0x1111111254fb6c44bac0bed2854e76f90643097d' as const
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      nonce: 5,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xabcdef',
-        },
-        {
-          mode: 2,
-          flags: 0x04,
-          target: erc20,
-          gasLimit: 60000n,
-          value: 0n,
-          data: '0x095ea7b3',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: dex,
-          gasLimit: 200000n,
-          value: 0n,
-          data: '0x12345678',
-        },
-      ],
-      maxPriorityFeePerGas: parseGwei('2'),
-      maxFeePerGas: parseGwei('20'),
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[1].flags & 0x04).toBe(0x04)
-    expect(parsed.frames[2].flags & 0x04).toBe(0x00)
+  test('unknown scheme rejected', () => {
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({
+          scheme: 3 as any,
+          signer: null,
+          msg: '0x',
+          signature: '0x',
+        }),
+      ),
+    ).toThrow('Invalid signature scheme 3')
   })
 
-  test('Example 3: Sponsored Transaction (only_verify + pay + sender)', () => {
-    const sponsor = '0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc' as const
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      nonce: 10,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x02,
-          target: null,
-          gasLimit: 30000n,
-          value: 0n,
-          data: '0xdeadbeef',
-        },
-        {
-          mode: 1,
-          flags: 0x01,
-          target: sponsor,
-          gasLimit: 40000n,
-          value: 0n,
-          data: '0xfeedface',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: '0x70997970c51812dc3a010c7d01b50e0d17dc79c8',
-          gasLimit: 100000n,
-          value: 0n,
-          data: '0xcafebabe',
-        },
-      ],
-      maxPriorityFeePerGas: parseGwei('1'),
-      maxFeePerGas: parseGwei('10'),
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].flags & 0x03).toBe(0x02)
-    expect(parsed.frames[1].flags & 0x03).toBe(0x01)
+  test('ARBITRARY signer must be empty', () => {
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({
+          scheme: 0,
+          signer: recipient,
+          msg: '0x',
+          signature: '0x1234',
+        }),
+      ),
+    ).toThrow('`signer` must be empty for ARBITRARY signatures.')
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({ scheme: 0, signer: null, msg: '0x', signature: '0x' }),
+      ),
+    ).not.toThrow()
   })
 
-  test('Example 1b: Account deployment (DEFAULT + VERIFY + SENDER)', () => {
-    const deployer = '0x4e59b44847b379578588920ca78fbf26c0b4956c' as const
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      nonce: 0,
-      sender,
-      frames: [
-        {
-          mode: 0,
-          flags: 0x00,
-          target: deployer,
-          gasLimit: 200000n,
-          value: 0n,
-          data: '0x600060005260206000f3',
-        },
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xaabbccdd',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: null,
-          gasLimit: 100000n,
-          value: 0n,
-          data: '0x11223344',
-        },
-      ],
-      maxPriorityFeePerGas: parseGwei('1'),
-      maxFeePerGas: parseGwei('10'),
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].mode).toBe(0)
-    expect(parsed.frames[1].mode).toBe(1)
-    expect(parsed.frames[2].mode).toBe(2)
+  test('msg must be empty or a non-zero 32-byte digest', () => {
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({
+          scheme: 1,
+          signer: null,
+          msg: '0x01',
+          signature: '0x',
+        }),
+      ),
+    ).toThrow('`msg` must be empty or a 32-byte digest.')
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({
+          scheme: 1,
+          signer: null,
+          msg: `0x${'00'.repeat(32)}`,
+          signature: '0x',
+        }),
+      ),
+    ).toThrow('`msg` must not be the zero digest.')
   })
 
-  test('multiple consecutive atomic batches', () => {
-    const target1 = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' as const
-    const target2 = '0x1111111254fb6c44bac0bed2854e76f90643097d' as const
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      nonce: 0,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 50000n,
-          value: 0n,
-          data: '0xaa',
-        },
-        {
-          mode: 2,
-          flags: 0x04,
-          target: target1,
-          gasLimit: 60000n,
-          value: 0n,
-          data: '0xbb',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: target1,
-          gasLimit: 60000n,
-          value: 0n,
-          data: '0xcc',
-        },
-        {
-          mode: 2,
-          flags: 0x04,
-          target: target2,
-          gasLimit: 80000n,
-          value: 0n,
-          data: '0xdd',
-        },
-        {
-          mode: 2,
-          flags: 0x04,
-          target: target2,
-          gasLimit: 80000n,
-          value: 0n,
-          data: '0xee',
-        },
-        {
-          mode: 2,
-          flags: 0x00,
-          target: target2,
-          gasLimit: 80000n,
-          value: 0n,
-          data: '0xff',
-        },
-      ],
-      maxPriorityFeePerGas: parseGwei('1'),
-      maxFeePerGas: parseGwei('10'),
-    }
-    expect(() => assertTransactionEIP8141(tx)).not.toThrow()
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames).toHaveLength(6)
+  test('SECP256K1 signature must be 65 bytes with v in {0, 1}', () => {
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({
+          scheme: 1,
+          signer: null,
+          msg: '0x',
+          signature: `0x${'ab'.repeat(64)}`,
+        }),
+      ),
+    ).toThrow('must be 65 bytes')
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({
+          scheme: 1,
+          signer: null,
+          msg: '0x',
+          signature: `0x1b${'ab'.repeat(64)}`,
+        }),
+      ),
+    ).toThrow('`v` must be 0 or 1')
+  })
+
+  test('P256 signature must be 128 bytes', () => {
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({
+          scheme: 2,
+          signer: recipient,
+          msg: '0x',
+          signature: `0x${'ab'.repeat(64)}`,
+        }),
+      ),
+    ).toThrow('must be 128 bytes')
+  })
+
+  test('invalid signer address rejected', () => {
+    expect(() =>
+      assertTransactionEIP8141(
+        withSignature({
+          scheme: 1,
+          signer: '0xnope' as any,
+          msg: '0x',
+          signature: '0x',
+        }),
+      ),
+    ).toThrow('Address "0xnope" is invalid.')
   })
 })
 
 describe('eip8141 blob-field invariants', () => {
   test('maxFeePerBlobGas non-zero without blobs rejected', () => {
     expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        maxFeePerBlobGas: 1000n,
-        blobVersionedHashes: [],
-      }),
+      assertTransactionEIP8141({ ...baseEIP8141, maxFeePerBlobGas: 1n }),
     ).toThrow('`maxFeePerBlobGas` must be 0 when no blob versioned hashes')
   })
 
-  test('maxFeePerBlobGas non-zero with undefined blobs rejected', () => {
-    const { blobVersionedHashes: _, ...tx } = baseEIP8141
-    expect(() =>
-      assertTransactionEIP8141({
-        ...tx,
-        maxFeePerBlobGas: 1000n,
-      }),
-    ).toThrow('`maxFeePerBlobGas` must be 0 when no blob versioned hashes')
-  })
-
-  test('blobs present but maxFeePerBlobGas is 0 rejected', () => {
+  test('blob versioned hashes must be 32 bytes with version 0x01', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
-        maxFeePerBlobGas: 0n,
-        blobVersionedHashes: [
-          '0x01febabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe',
-        ],
+        maxFeePerBlobGas: 1n,
+        blobVersionedHashes: ['0x0100'],
       }),
-    ).toThrow(
-      '`maxFeePerBlobGas` must be non-zero when blob versioned hashes are present',
-    )
-  })
-
-  test('blobs present but maxFeePerBlobGas undefined rejected', () => {
+    ).toThrow('Versioned hash "0x0100" size is invalid.')
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
-        maxFeePerBlobGas: undefined,
-        blobVersionedHashes: [
-          '0x01febabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe',
-        ],
+        maxFeePerBlobGas: 1n,
+        blobVersionedHashes: [`0x02${'00'.repeat(31)}`],
       }),
-    ).toThrow(
-      '`maxFeePerBlobGas` must be non-zero when blob versioned hashes are present',
-    )
+    ).toThrow('version is invalid')
   })
 
   test('blobs present with valid maxFeePerBlobGas passes', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...baseEIP8141,
-        maxFeePerBlobGas: 1000n,
-        blobVersionedHashes: [
-          '0x01febabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe',
-        ],
+        maxFeePerBlobGas: 1n,
+        blobVersionedHashes: [`0x01${'00'.repeat(31)}`],
       }),
     ).not.toThrow()
-  })
-
-  test('no blobs and maxFeePerBlobGas=0 passes', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...baseEIP8141,
-        maxFeePerBlobGas: 0n,
-        blobVersionedHashes: [],
-      }),
-    ).not.toThrow()
-  })
-
-  test('no blobs and maxFeePerBlobGas undefined passes', () => {
-    const { maxFeePerBlobGas: _, blobVersionedHashes: __, ...tx } = baseEIP8141
-    expect(() => assertTransactionEIP8141(tx)).not.toThrow()
   })
 })
 
 describe('eip8141 parser strictness', () => {
+  const payload = (tx: TransactionSerializableEIP8141) =>
+    fromRlp(`0x${serializeTransaction(tx).slice(4)}`, 'hex') as any[]
+  const encode = (items: any) =>
+    concatHex(['0x06', toRlp(items)]) as TransactionSerializedEIP8141
+
+  test('rejects wrong number of top-level RLP items', () => {
+    const items = payload(baseEIP8141)
+    expect(() => parseTransaction(encode(items.slice(0, 6)))).toThrow(
+      'Invalid serialized transaction of type "eip8141" was provided.',
+    )
+  })
+
+  test('rejects fees list with wrong length', () => {
+    const items = payload(baseEIP8141)
+    items[5] = items[5].slice(0, 2)
+    expect(() => parseTransaction(encode(items))).toThrow(
+      'Invalid serialized transaction of type "eip8141" was provided.',
+    )
+  })
+
   test('rejects frame tuple with fewer than 6 elements', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 21000n,
-          value: 0n,
-          data: '0xaa',
-        },
-      ],
-    }
-    const serialized = serializeTransaction(tx)
-    const hex = serialized.slice(4)
-    const items = fromRlp(`0x${hex}`, 'hex') as any[]
-    const frames = items[3] as any[]
-    frames[0] = frames[0].slice(0, 5)
-    const reEncoded =
-      `0x06${toRlp(items).slice(2)}` as TransactionSerializedEIP8141
-    expect(() => parseTransaction(reEncoded)).toThrow()
+    const items = payload(baseEIP8141)
+    items[3][0] = items[3][0].slice(0, 5)
+    expect(() => parseTransaction(encode(items))).toThrow(
+      'Invalid serialized transaction of type "eip8141" was provided.',
+    )
+  })
+
+  test('rejects frame limits with wrong length', () => {
+    const items = payload(baseEIP8141)
+    items[3][0][3] = ['0x01']
+    expect(() => parseTransaction(encode(items))).toThrow(
+      'Invalid serialized transaction of type "eip8141" was provided.',
+    )
+  })
+
+  test('rejects signature tuple with wrong length', () => {
+    const items = payload(baseEIP8141)
+    items[4] = [['0x01', '0x', '0x']]
+    expect(() => parseTransaction(encode(items))).toThrow(
+      'Invalid serialized transaction of type "eip8141" was provided.',
+    )
   })
 
   test('rejects nonce above Number.MAX_SAFE_INTEGER', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 21000n,
-          value: 0n,
-          data: '0xaa',
-        },
-      ],
-      nonce: 42,
-    }
-    const serialized = serializeTransaction(tx)
-    const hex = serialized.slice(4)
-    const items = fromRlp(`0x${hex}`, 'hex') as any[]
-    items[1] = numberToHex(BigInt(Number.MAX_SAFE_INTEGER) + 1n)
-    const reEncoded =
-      `0x06${toRlp(items).slice(2)}` as TransactionSerializedEIP8141
-    expect(() => parseTransaction(reEncoded)).toThrow()
+    const items = payload(baseEIP8141)
+    items[1] = numberToHex(2n ** 60n)
+    expect(() => parseTransaction(encode(items))).toThrow(
+      'Invalid serialized transaction of type "eip8141" was provided.',
+    )
+  })
+
+  test('rejects frame mode > 2', () => {
+    const items = payload(baseEIP8141)
+    items[3][0][0] = '0x03'
+    expect(() => parseTransaction(encode(items))).toThrow(
+      'Invalid serialized transaction of type "eip8141" was provided.',
+    )
   })
 })
 
-describe('eip8141 edge cases', () => {
-  test('null target resolves correctly (serialized as empty 0x)', () => {
+describe('eip8141 spec examples', () => {
+  test('Example 1a: simple ETH transfer', () => {
     const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      sender,
+      ...baseEIP8141,
       frames: [
+        verifyFrame,
         {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 21000n,
-          value: 0n,
+          mode: SENDER,
+          flags: 0,
+          target: recipient,
+          limits: { execution: 21_000n, state: 0n },
+          value: 1_000_000_000_000_000n,
           data: '0x',
         },
       ],
     }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].target).toBeNull()
+    expect(parseTransaction(serializeTransaction(tx))).toEqual({
+      ...tx,
+      type: 'eip8141',
+    })
   })
 
-  test('explicit target address preserved', () => {
-    const target = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8' as const
+  test('Example 1b: account deployment (DEFAULT + VERIFY + SENDER)', () => {
     const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      sender,
+      ...baseEIP8141,
       frames: [
         {
-          mode: 1,
-          flags: 0x03,
-          target,
-          gasLimit: 21000n,
+          mode: DEFAULT,
+          flags: 0,
+          target: getAddress('0x0000000000000000000000000000000000007997'),
+          limits: { execution: 200_000n, state: 100_000n },
           value: 0n,
-          data: '0x',
+          data: '0xdeadbeef',
+        },
+        verifyFrame,
+        senderFrame,
+      ],
+    }
+    expect(() => assertTransactionEIP8141(tx)).not.toThrow()
+    expect(parseTransaction(serializeTransaction(tx))).toEqual({
+      ...tx,
+      type: 'eip8141',
+    })
+  })
+
+  test('Example 2: atomic approve + swap', () => {
+    const tx: TransactionSerializableEIP8141 = {
+      ...baseEIP8141,
+      frames: [
+        verifyFrame,
+        { ...senderFrame, flags: ATOMIC_BATCH_FLAG },
+        senderFrame,
+      ],
+    }
+    expect(() => assertTransactionEIP8141(tx)).not.toThrow()
+    expect(parseTransaction(serializeTransaction(tx))).toEqual({
+      ...tx,
+      type: 'eip8141',
+    })
+  })
+
+  test('Example 3: sponsored transaction', () => {
+    const sponsor = getAddress('0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc')
+    const tx: TransactionSerializableEIP8141 = {
+      ...baseEIP8141,
+      frames: [
+        { ...verifyFrame, flags: APPROVE_EXECUTION },
+        {
+          ...verifyFrame,
+          flags: APPROVE_PAYMENT,
+          target: sponsor,
+          data: '0x1234',
+        },
+        senderFrame,
+        senderFrame,
+        { ...senderFrame, mode: DEFAULT, target: sponsor },
+      ],
+      signatures: [
+        { scheme: 1, signer: null, msg: '0x', signature: '0x' },
+        {
+          scheme: 1,
+          signer: sponsor,
+          msg: '0x',
+          signature: `0x00${'ab'.repeat(64)}`,
         },
       ],
     }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].target).toBe(getAddress(target))
-  })
-
-  test('empty data preserved as 0x', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 21000n,
-          value: 0n,
-          data: '0x',
-        },
-      ],
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].data).toBe('0x')
-  })
-
-  test('zero gasLimit preserved', () => {
-    const tx: TransactionSerializableEIP8141 = {
-      chainId: 1,
-      sender,
-      frames: [
-        {
-          mode: 1,
-          flags: 0x03,
-          target: null,
-          gasLimit: 0n,
-          value: 0n,
-          data: '0xaa',
-        },
-      ],
-    }
-    const serialized = serializeTransaction(tx)
-    const parsed = parseTransaction(serialized)
-    expect(parsed.frames[0].gasLimit).toBe(0n)
-  })
-
-  test('serialized type byte is 0x06', () => {
-    const serialized = serializeTransaction(baseEIP8141)
-    expect(serialized.slice(0, 4)).toBe('0x06')
-  })
-
-  test('parse rejects wrong number of top-level RLP items', () => {
-    expect(() =>
-      parseTransaction('0x06c50102030405' as TransactionSerializedEIP8141),
-    ).toThrow()
+    expect(() => assertTransactionEIP8141(tx)).not.toThrow()
+    expect(parseTransaction(serializeTransaction(tx))).toEqual({
+      ...tx,
+      type: 'eip8141',
+    })
   })
 })

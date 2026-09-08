@@ -159,22 +159,64 @@ test('eip8141 receipt with payer and frameReceipts', () => {
       {
         status: '0x1',
         gasUsed: '0x5208',
-        logs: [],
+        stateGasUsed: '0x3e8',
+        logs: [
+          {
+            address: '0x15d4c048f83bd7e37d49ea4c83a07267ec4203da',
+            data: '0x',
+            topics: [],
+          },
+        ],
       },
       {
         status: '0x0',
         gasUsed: '0x186a0',
+        stateGasUsed: '0x0',
+        logs: [],
+      },
+      {
+        status: '0x2',
+        gasUsed: '0x0',
         logs: [],
       },
     ],
   } as any)
   expect(receipt.type).toBe('eip8141')
   expect(receipt.payer).toBe('0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc')
-  expect(receipt.frameReceipts).toHaveLength(2)
-  expect(receipt.frameReceipts![0].status).toBe('success')
-  expect(receipt.frameReceipts![0].gasUsed).toBe(21000n)
-  expect(receipt.frameReceipts![1].status).toBe('reverted')
-  expect(receipt.frameReceipts![1].gasUsed).toBe(100000n)
+  expect(receipt.frameReceipts).toMatchInlineSnapshot(`
+    [
+      {
+        "gasUsed": 21000n,
+        "logs": [
+          {
+            "address": "0x15d4c048f83bd7e37d49ea4c83a07267ec4203da",
+            "blockHash": null,
+            "blockNumber": null,
+            "blockTimestamp": undefined,
+            "data": "0x",
+            "logIndex": null,
+            "topics": [],
+            "transactionHash": null,
+            "transactionIndex": null,
+          },
+        ],
+        "stateGasUsed": 1000n,
+        "status": "success",
+      },
+      {
+        "gasUsed": 100000n,
+        "logs": [],
+        "stateGasUsed": 0n,
+        "status": "reverted",
+      },
+      {
+        "gasUsed": 0n,
+        "logs": [],
+        "stateGasUsed": 0n,
+        "status": "skipped",
+      },
+    ]
+  `)
 })
 
 test('non-eip8141 receipt has no payer or frameReceipts', () => {

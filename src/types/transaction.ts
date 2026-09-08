@@ -36,11 +36,19 @@ export type TransactionType =
   | 'eip8141'
   | (string & {})
 
-/** EIP-8141 frame execution mode (lower 8 bits of `mode` field). */
+/** EIP-8141 frame execution mode. */
 export type FrameMode =
   | 0 // DEFAULT: execute as ENTRY_POINT (address 0xaa)
-  | 1 // VERIFY:  read-only validation; must call APPROVE opcode
+  | 1 // VERIFY:  read-only validation; may call the APPROVE opcode
   | 2 // SENDER:  execute as tx.sender (requires prior approval)
+
+/** EIP-8141 two-dimensional frame gas limits (`limits = [execution, state]`). */
+export type FrameLimits<quantity = bigint> = {
+  /** Maximum execution gas the frame may consume. */
+  execution: quantity
+  /** Maximum state gas (EIP-8037) the frame may consume. */
+  state: quantity
+}
 
 /**
  * A single frame in an EIP-8141 Frame Transaction.
@@ -52,14 +60,14 @@ export type Frame = {
   /**
    * Flag bits configuring execution constraints.
    * Bits 0-1: approval scope (APPROVE_SCOPE_MASK = 0x03).
-   * Bit 2:    atomic batch flag (SENDER mode only).
-   * Bits 3-7: reserved, must be zero.
+   * Bit 2:    atomic batch flag (DEFAULT and SENDER modes only).
+   * Bits 3..: reserved, must be zero.
    */
   flags: number
   /** Target address for this frame, or `null` to use `tx.sender`. */
   target: Address | null
-  /** Gas allocated exclusively to this frame. */
-  gasLimit: bigint
+  /** Execution and state gas limits allocated exclusively to this frame. */
+  limits: FrameLimits
   /**
    * Must be `0` for `DEFAULT` and `VERIFY` modes; only `SENDER` may be non-zero.
    */
@@ -68,12 +76,54 @@ export type Frame = {
   data: Hex
 }
 
-/** Per-frame receipt as defined by EIP-8141: `[status, gas_used, logs]`. */
-export type FrameReceipt<quantity = bigint, index = number> = {
-  /** Return status of the frame's top-level call. */
-  status: 'success' | 'reverted'
-  /** Gas consumed by this frame. */
+/** EIP-8141 signature verification scheme. */
+export type FrameSignatureScheme =
+  | 0 // ARBITRARY: arbitrary bytes, not validated by the protocol
+  | 1 // SECP256K1: `v (1 byte) || r (32 bytes) || s (32 bytes)`
+  | 2 // P256:      `r || s || qx || qy` (32 bytes each)
+
+/**
+ * An entry in the EIP-8141 outer `signatures` list:
+ * `[scheme, signer, msg, signature]`.
+ */
+export type FrameSignature = {
+  /** Verification scheme used to interpret `signature`. */
+  scheme: FrameSignatureScheme
+  /**
+   * Signer address for `SECP256K1` / `P256`, or `null` to resolve to
+   * `tx.sender`. Must be `null` for `ARBITRARY`.
+   */
+  signer: Address | null
+  /**
+   * `'0x'` to sign the canonical transaction signature hash, or an explicit
+   * non-zero 32-byte digest.
+   */
+  msg: Hex
+  /**
+   * Raw signature bytes. Entries with an empty `msg` have these bytes elided
+   * when computing the canonical signature hash.
+   */
+  signature: Hex
+}
+
+/** Per-frame receipt status: `0x0` failure, `0x1` success, `0x2` skipped. */
+export type FrameReceiptStatus = 'success' | 'reverted' | 'skipped'
+
+/** Per-frame receipt as defined by EIP-8141: `[status, [execution, state], logs]`. */
+export type FrameReceipt<
+  quantity = bigint,
+  index = number,
+  status = FrameReceiptStatus,
+> = {
+  /**
+   * Return status of the frame's top-level call. `'skipped'` marks a frame
+   * that never executed because an earlier frame of its atomic batch failed.
+   */
+  status: status
+  /** Execution gas consumed by this frame (before refunds). */
   gasUsed: quantity
+  /** State gas attributed to this frame after all refills and rollbacks. */
+  stateGasUsed: quantity
   /** Logs emitted during this frame's execution. */
   logs: Log<quantity, index, false>[]
 }
@@ -243,8 +293,9 @@ export type TransactionEIP7702<
 
 /**
  * EIP-8141 Frame Transaction as returned by `eth_getTransactionByHash`.
- * Authorization is embedded in frame data rather than a top-level ECDSA signature,
- * so `r`, `s`, `v`, `yParity`, `to`, `value`, and `input` are absent.
+ * Authorization is carried by the outer `signatures` list and the frames
+ * rather than a top-level ECDSA signature, so `r`, `s`, `v`, `yParity`,
+ * `to`, `value`, and `input` are absent.
  */
 export type TransactionEIP8141<
   quantity = bigint,
@@ -276,6 +327,8 @@ export type TransactionEIP8141<
   sender: Address
   /** Ordered list of execution frames. */
   frames: readonly Frame[]
+  /** Outer signature list, validated before any frame executes. */
+  signatures: readonly FrameSignature[]
   /** Index of this transaction in the block, or `null` if pending. */
   transactionIndex: isPending extends true ? null : index
   /** The type represented as hex. */
@@ -381,8 +434,9 @@ export type TransactionRequestEIP7702<
 
 /**
  * EIP-8141 Frame Transaction request (for `eth_sendRawTransaction`).
- * Authorization is carried inside frame data, so there is no top-level ECDSA
- * signature and no `to`/`value`/`data` fields at the envelope level.
+ * Authorization is carried by the outer `signatures` list and the frames,
+ * so there is no top-level ECDSA signature and no `to`/`value`/`data`
+ * fields at the envelope level.
  */
 export type TransactionRequestEIP8141<
   quantity = bigint,
@@ -399,6 +453,8 @@ export type TransactionRequestEIP8141<
   sender: Address
   /** Ordered list of execution frames. */
   frames: readonly Frame[]
+  /** Outer signature list, validated before any frame executes. */
+  signatures?: readonly FrameSignature[] | undefined
   /** Maximum priority fee per gas unit. */
   maxPriorityFeePerGas?: quantity | undefined
   /** Maximum total fee per gas unit. */
@@ -531,7 +587,10 @@ export type TransactionSerializableEIP7702<
 /**
  * EIP-8141 Frame Transaction ready for RLP serialization.
  * Does not extend `TransactionSerializableBase` because there is no ECDSA
- * signature envelope; authorization lives inside the VERIFY frame data.
+ * signature envelope; authorization lives in the outer `signatures` list.
+ *
+ * The canonical signature hash is `keccak256(serializeTransaction(tx))` with
+ * the `signature` bytes of every entry whose `msg` is `'0x'` elided.
  */
 export type TransactionSerializableEIP8141<
   quantity = bigint,
@@ -545,6 +604,12 @@ export type TransactionSerializableEIP8141<
   sender: Address
   /** Ordered list of execution frames (1 to MAX_FRAMES = 64). */
   frames: readonly Frame[]
+  /**
+   * Outer signature list. When signing with `signTransaction`, the first
+   * `SECP256K1` entry with no explicit `signer`, an empty `msg` and an empty
+   * `signature` receives the signature (one is appended if none exists).
+   */
+  signatures?: readonly FrameSignature[] | undefined
   /** Maximum priority fee per gas unit. */
   maxPriorityFeePerGas?: quantity | undefined
   /** Maximum total fee per gas unit. */

@@ -149,8 +149,8 @@ test('legacy', async () => {
   ).toMatchInlineSnapshot(`"0xb03B8ffAB1f3Ac3CabE4A0B2ED441fDFd3C96C8E"`)
 })
 
-test('eip8141 requires explicit signature', async () => {
-  const serializedTransaction = serializeTransaction({
+test('eip8141', async () => {
+  const transaction = {
     chainId: 1,
     sender: accounts[0].address,
     frames: [
@@ -158,15 +158,23 @@ test('eip8141 requires explicit signature', async () => {
         mode: 1,
         flags: 0x03,
         target: null,
-        gasLimit: 21000n,
+        limits: { execution: 21000n, state: 0n },
         data: '0x',
       },
     ],
-  } satisfies TransactionSerializableEIP8141)
+  } satisfies TransactionSerializableEIP8141
+
+  const serializedTransaction = await signTransaction({
+    privateKey: accounts[0].privateKey,
+    transaction,
+  })
+  expect(
+    await recoverTransactionAddress({ serializedTransaction }),
+  ).toMatchInlineSnapshot(`"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"`)
 
   await expect(() =>
     recoverTransactionAddress({
-      serializedTransaction,
+      serializedTransaction: serializeTransaction(transaction),
     }),
-  ).rejects.toThrow('EIP-8141 transactions require an explicit `signature`')
+  ).rejects.toThrow('EIP-8141 transactions require a `SECP256K1` signature')
 })

@@ -21,7 +21,7 @@ describe('eip8141', () => {
         mode: 1 as const,
         flags: 0x03,
         target: null,
-        gasLimit: 50000n,
+        limits: { execution: 50000n, state: 0n },
         data: '0xab' as const,
       },
     ],
@@ -45,29 +45,12 @@ describe('eip8141', () => {
       mode: 0 as const,
       flags: 0,
       target: sender,
-      gasLimit: 1n,
+      limits: { execution: 1n, state: 0n },
       data: '0x' as const,
     }))
     expect(() => assertTransactionEIP8141({ ...validTx, frames })).toThrow(
       'MAX_FRAMES (64)',
     )
-  })
-
-  test('VERIFY with zero scope rejected', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...validTx,
-        frames: [
-          {
-            mode: 1,
-            flags: 0x00,
-            target: null,
-            gasLimit: 1n,
-            data: '0x' as const,
-          },
-        ],
-      }),
-    ).toThrow('non-zero APPROVE scope')
   })
 
   test('reserved flag bits rejected', () => {
@@ -78,8 +61,8 @@ describe('eip8141', () => {
           {
             mode: 2,
             flags: 0x08,
-            target: null,
-            gasLimit: 1n,
+            target: sender,
+            limits: { execution: 1n, state: 0n },
             data: '0x' as const,
           },
         ],
@@ -87,64 +70,68 @@ describe('eip8141', () => {
     ).toThrow('reserved')
   })
 
-  test('atomic batch on DEFAULT rejected', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...validTx,
-        frames: [
-          {
-            mode: 0,
-            flags: 0x04,
-            target: sender,
-            gasLimit: 1n,
-            data: '0x' as const,
-          },
-          {
-            mode: 2,
-            flags: 0x00,
-            target: null,
-            gasLimit: 1n,
-            data: '0x' as const,
-          },
-        ],
-      }),
-    ).toThrow('only valid with SENDER')
-  })
-
-  test('gas limit per frame bounded to 2^63-1', () => {
+  test('atomic batch flag on VERIFY frame rejected', () => {
     expect(() =>
       assertTransactionEIP8141({
         ...validTx,
         frames: [
           {
             mode: 1,
-            flags: 0x03,
+            flags: 0x04,
             target: null,
-            gasLimit: 2n ** 63n,
+            limits: { execution: 1n, state: 0n },
+            data: '0x' as const,
+          },
+          {
+            mode: 2,
+            flags: 0,
+            target: sender,
+            limits: { execution: 1n, state: 0n },
             data: '0x' as const,
           },
         ],
       }),
-    ).toThrow('gasLimit')
+    ).toThrow('not valid with VERIFY mode')
+  })
+
+  test('total frame gas must be less than 2^64', () => {
+    expect(() =>
+      assertTransactionEIP8141({
+        ...validTx,
+        frames: [
+          {
+            mode: 2,
+            flags: 0,
+            target: sender,
+            limits: { execution: 2n ** 63n, state: 2n ** 63n },
+            data: '0x' as const,
+          },
+        ],
+      }),
+    ).toThrow('less than 2^64')
+  })
+
+  test('unknown signature scheme rejected', () => {
+    expect(() =>
+      assertTransactionEIP8141({
+        ...validTx,
+        signatures: [
+          { scheme: 5 as any, signer: null, msg: '0x', signature: '0x' },
+        ],
+      }),
+    ).toThrow('Invalid signature scheme 5')
+  })
+
+  test('maxFeePerBlobGas without blobs rejected', () => {
+    expect(() =>
+      assertTransactionEIP8141({ ...validTx, maxFeePerBlobGas: 1n }),
+    ).toThrow('`maxFeePerBlobGas` must be 0')
   })
 
   test('fee cap too high', () => {
     expect(() =>
-      assertTransactionEIP8141({
-        ...validTx,
-        maxFeePerGas: maxUint256 + 1n,
-      }),
-    ).toThrow()
-  })
-
-  test('tip above fee cap', () => {
-    expect(() =>
-      assertTransactionEIP8141({
-        ...validTx,
-        maxFeePerGas: parseGwei('1'),
-        maxPriorityFeePerGas: parseGwei('2'),
-      }),
-    ).toThrow()
+      assertTransactionEIP8141({ ...validTx, maxFeePerGas: 2n ** 256n }),
+    ).toThrow('The fee cap')
   })
 })
 

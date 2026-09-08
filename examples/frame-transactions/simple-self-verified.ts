@@ -1,81 +1,69 @@
 /**
- * Simple Self-Verified Frame Transaction
+ * Simple Self-Verified Frame Transaction (EIP-8141 Example 1a)
  *
- * The most basic EIP-8141 pattern: two frames.
+ * The most basic EIP-8141 pattern: two frames and one signature.
  *
- *   Frame 0 (VERIFY):  The sender's validator contract runs read-only
- *                       validation and calls APPROVE to authorise the tx.
+ *   Frame 0 (VERIFY):  Targets `null` (the sender). An account without code
+ *                       runs the protocol's default code, which checks the
+ *                       sender's SECP256K1 signature in `tx.signatures` and
+ *                       calls APPROVE(EXECUTION_AND_PAYMENT).
  *   Frame 1 (SENDER):  Executes a plain ETH transfer as the sender.
  *
- * No third-party payer, no batching -- just native account abstraction.
+ * `signTransaction` signs the canonical signature hash and places the
+ * signature (`v || r || s`) into the outer `signatures` list.
  */
 
 import {
   type Address,
   createClient,
-  encodeFunctionData,
   type Hex,
   http,
   parseEther,
   parseGwei,
-  serializeTransaction,
   type TransactionSerializableEIP8141,
 } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
+import { sendRawTransaction } from 'viem/actions'
 
 const RPC_URL = 'https://rpc1.eip-8141.ethrex.xyz'
 const CHAIN_ID = 3151908
 
-// Demo addresses -- replace with your own for a real network.
-const sender: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266'
-const validator: Address = '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512'
+// Demo key -- replace with your own for a real network.
+const PRIVATE_KEY = (process.env.PRIVATE_KEY ??
+  '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80') as Hex
+
+const account = privateKeyToAccount(PRIVATE_KEY)
 const recipient: Address = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8'
 
-// Minimal validator ABI -- the VERIFY frame calls `validate` on the
-// sender's validator contract.  The contract is expected to inspect
-// the transaction context and call the APPROVE opcode if it is valid.
-const validatorAbi = [
-  {
-    name: 'validate',
-    type: 'function',
-    inputs: [{ name: 'txHash', type: 'bytes32' }],
-    outputs: [],
-    stateMutability: 'view',
-  },
-] as const
+const VERIFY = 1
+const SENDER = 2
+const APPROVE_EXECUTION_AND_PAYMENT = 0x03
 
 const tx: TransactionSerializableEIP8141 = {
   type: 'eip8141',
   chainId: CHAIN_ID,
   nonce: 0,
-  sender,
+  sender: account.address,
   maxPriorityFeePerGas: parseGwei('1'),
   maxFeePerGas: parseGwei('10'),
-  maxFeePerBlobGas: 0n,
-  blobVersionedHashes: [],
   frames: [
-    // Frame 0 -- VERIFY: read-only validation by the sender's validator.
-    // flags=0x01 means approval scope covers the immediate next frame.
+    // Frame 0 -- VERIFY: default code checks `signatures[0]` and approves
+    // both execution and payment for the sender.
     {
-      mode: 1,
-      flags: 0x01,
-      target: validator,
-      gasLimit: 50_000n,
+      mode: VERIFY,
+      flags: APPROVE_EXECUTION_AND_PAYMENT,
+      target: null,
+      limits: { execution: 30_000n, state: 0n },
       value: 0n,
-      data: encodeFunctionData({
-        abi: validatorAbi,
-        functionName: 'validate',
-        args: [
-          '0x0000000000000000000000000000000000000000000000000000000000000000',
-        ],
-      }),
+      data: '0x',
     },
 
     // Frame 1 -- SENDER: transfer ETH to recipient.
     {
-      mode: 2,
-      flags: 0x00,
+      mode: SENDER,
+      flags: 0,
       target: recipient,
-      gasLimit: 21_000n,
+      limits: { execution: 21_000n, state: 0n },
       value: parseEther('0.001'),
       data: '0x',
     },
@@ -83,7 +71,8 @@ const tx: TransactionSerializableEIP8141 = {
 }
 
 async function main() {
-  const serialized = serializeTransaction(tx)
+  // `signTransaction` appends the sender's SECP256K1 signature to `signatures`.
+  const serialized = await account.signTransaction(tx)
   console.log('Serialized EIP-8141 tx:', serialized.slice(0, 66), '...')
   console.log('Type byte: 0x06 (EIP-8141)')
   console.log('Frames:', tx.frames.length)
@@ -92,9 +81,8 @@ async function main() {
   const client = createClient({ transport: http(RPC_URL) })
 
   console.log('Sending to', RPC_URL, `(chainId ${CHAIN_ID}) ...`)
-  const hash = await client.request({
-    method: 'eth_sendRawTransaction' as any,
-    params: [serialized as Hex],
+  const hash = await sendRawTransaction(client, {
+    serializedTransaction: serialized,
   })
   console.log('Transaction hash:', hash)
 }

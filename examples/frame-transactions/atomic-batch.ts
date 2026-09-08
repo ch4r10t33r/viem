@@ -1,10 +1,11 @@
 /**
- * Atomic Batch Frame Transaction
+ * Atomic Batch Frame Transaction (EIP-8141 Example 2)
  *
  * Uses the ATOMIC_BATCH_FLAG (0x04) to link two SENDER frames so they
  * execute atomically: if either reverts, both revert.
  *
- *   Frame 0 (VERIFY):   Sender's validator approves.
+ *   Frame 0 (VERIFY):   Default code checks the sender's signature and
+ *                        calls APPROVE(EXECUTION_AND_PAYMENT).
  *   Frame 1 (SENDER):   ERC-20 `approve` -- grant the DEX router an allowance.
  *                        flags=0x04 (atomic) links this frame to the next.
  *   Frame 2 (SENDER):   DEX `swapExactTokensForTokens` -- swap tokens.
@@ -12,7 +13,8 @@
  *
  * Without atomicity, a successful approve followed by a reverted swap
  * would leave a dangling allowance. The atomic batch flag guarantees
- * all-or-nothing execution at the protocol level.
+ * all-or-nothing execution at the protocol level. Frames inside a batch
+ * may not carry an APPROVE scope.
  */
 
 import {
@@ -23,31 +25,27 @@ import {
   http,
   parseGwei,
   parseUnits,
-  serializeTransaction,
   type TransactionSerializableEIP8141,
 } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
+import { sendRawTransaction } from 'viem/actions'
 
 const RPC_URL = 'https://rpc1.eip-8141.ethrex.xyz'
 const CHAIN_ID = 3151908
 
-// Demo addresses.
-const sender: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266'
-const validator: Address = '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512'
+// Demo key and addresses -- replace with your own for a real network.
+const PRIVATE_KEY = (process.env.PRIVATE_KEY ??
+  '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80') as Hex
+
+const account = privateKeyToAccount(PRIVATE_KEY)
 const usdcToken: Address = '0x5FbDB2315678afecb367f032d93F642f64180aa3'
 const dexRouter: Address = '0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9'
 const wethToken: Address = '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0'
 
+const VERIFY = 1
+const SENDER = 2
+const APPROVE_EXECUTION_AND_PAYMENT = 0x03
 const ATOMIC_BATCH_FLAG = 0x04
-
-const validatorAbi = [
-  {
-    name: 'validate',
-    type: 'function',
-    inputs: [{ name: 'txHash', type: 'bytes32' }],
-    outputs: [],
-    stateMutability: 'view',
-  },
-] as const
 
 const erc20Abi = [
   {
@@ -86,36 +84,28 @@ const tx: TransactionSerializableEIP8141 = {
   type: 'eip8141',
   chainId: CHAIN_ID,
   nonce: 2,
-  sender,
+  sender: account.address,
   maxPriorityFeePerGas: parseGwei('1'),
   maxFeePerGas: parseGwei('10'),
-  maxFeePerBlobGas: 0n,
-  blobVersionedHashes: [],
   frames: [
-    // Frame 0 -- VERIFY: sender's validator authorises.
+    // Frame 0 -- VERIFY: default code checks `signatures[0]` and approves.
     {
-      mode: 1,
-      flags: 0x03,
-      target: validator,
-      gasLimit: 50_000n,
+      mode: VERIFY,
+      flags: APPROVE_EXECUTION_AND_PAYMENT,
+      target: null,
+      limits: { execution: 30_000n, state: 0n },
       value: 0n,
-      data: encodeFunctionData({
-        abi: validatorAbi,
-        functionName: 'validate',
-        args: [
-          '0x0000000000000000000000000000000000000000000000000000000000000002',
-        ],
-      }),
+      data: '0x',
     },
 
     // Frame 1 -- SENDER + ATOMIC: approve the DEX router to spend USDC.
     // The atomic batch flag (0x04) links this frame to the next one.
     // If the swap in frame 2 reverts, this approve is also rolled back.
     {
-      mode: 2,
+      mode: SENDER,
       flags: ATOMIC_BATCH_FLAG,
       target: usdcToken,
-      gasLimit: 60_000n,
+      limits: { execution: 60_000n, state: 25_000n },
       value: 0n,
       data: encodeFunctionData({
         abi: erc20Abi,
@@ -127,22 +117,28 @@ const tx: TransactionSerializableEIP8141 = {
     // Frame 2 -- SENDER: swap USDC -> WETH on the DEX.
     // flags=0x00: last frame in the atomic group, no further chaining.
     {
-      mode: 2,
-      flags: 0x00,
+      mode: SENDER,
+      flags: 0,
       target: dexRouter,
-      gasLimit: 200_000n,
+      limits: { execution: 200_000n, state: 50_000n },
       value: 0n,
       data: encodeFunctionData({
         abi: dexAbi,
         functionName: 'swapExactTokensForTokens',
-        args: [swapAmount, minOut, [usdcToken, wethToken], sender, deadline],
+        args: [
+          swapAmount,
+          minOut,
+          [usdcToken, wethToken],
+          account.address,
+          deadline,
+        ],
       }),
     },
   ],
 }
 
 async function main() {
-  const serialized = serializeTransaction(tx)
+  const serialized = await account.signTransaction(tx)
   console.log(
     'Serialized atomic-batch EIP-8141 tx:',
     serialized.slice(0, 66),
@@ -150,7 +146,7 @@ async function main() {
   )
   console.log('Type byte: 0x06 (EIP-8141)')
   console.log('Frames:', tx.frames.length)
-  console.log('  [0] VERIFY          - validator approves')
+  console.log('  [0] VERIFY          - default code approves')
   console.log('  [1] SENDER (atomic) - approve USDC for DEX router')
   console.log('  [2] SENDER          - swap USDC -> WETH')
   console.log()
@@ -162,9 +158,8 @@ async function main() {
   const client = createClient({ transport: http(RPC_URL) })
 
   console.log('Sending to', RPC_URL, `(chainId ${CHAIN_ID}) ...`)
-  const hash = await client.request({
-    method: 'eth_sendRawTransaction' as any,
-    params: [serialized as Hex],
+  const hash = await sendRawTransaction(client, {
+    serializedTransaction: serialized,
   })
   console.log('Transaction hash:', hash)
 }
