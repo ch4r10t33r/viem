@@ -3,14 +3,26 @@ import * as Hex from 'ox/Hex'
 import { TokenId, TokenRole } from 'ox/tempo'
 import type { Account } from '../../accounts/types.js'
 import { parseAccount } from '../../accounts/utils/parseAccount.js'
-import { multicall } from '../../actions/public/multicall.js'
-import type { ReadContractReturnType } from '../../actions/public/readContract.js'
-import { readContract } from '../../actions/public/readContract.js'
+import { estimateContractGas } from '../../actions/public/estimateContractGas.js'
+import {
+  type MulticallParameters,
+  type MulticallReturnType,
+  multicall,
+} from '../../actions/public/multicall.js'
+import {
+  type ReadContractReturnType,
+  readContract,
+} from '../../actions/public/readContract.js'
+import {
+  type SimulateContractReturnType,
+  simulateContract,
+} from '../../actions/public/simulateContract.js'
 import type {
   WatchContractEventParameters,
   WatchContractEventReturnType,
 } from '../../actions/public/watchContractEvent.js'
 import { watchContractEvent } from '../../actions/public/watchContractEvent.js'
+import * as internal_Token from '../../actions/token/internal.js'
 import { sendTransaction } from '../../actions/wallet/sendTransaction.js'
 import {
   type SendTransactionSyncParameters,
@@ -21,6 +33,7 @@ import { writeContract } from '../../actions/wallet/writeContract.js'
 import { writeContractSync } from '../../actions/wallet/writeContractSync.js'
 import type { Client } from '../../clients/createClient.js'
 import type { Transport } from '../../clients/transports/createTransport.js'
+import { AccountNotFoundError } from '../../errors/account.js'
 import type { BaseErrorType } from '../../errors/base.js'
 import type { Chain } from '../../types/chain.js'
 import type { ExtractAbiItem, GetEventArgs } from '../../types/contract.js'
@@ -28,14 +41,25 @@ import type { Log, Log as viem_Log } from '../../types/log.js'
 import type { Compute, OneOf, UnionOmit } from '../../types/utils.js'
 import { encodeFunctionData } from '../../utils/abi/encodeFunctionData.js'
 import { parseEventLogs } from '../../utils/abi/parseEventLogs.js'
+import { formatUnits } from '../../utils/unit/formatUnits.js'
 import * as Abis from '../Abis.js'
 import * as Addresses from '../Addresses.js'
 import type {
   GetAccountParameter,
   ReadParameters,
+  TokenParameter,
+  TokenParameters,
   WriteParameters,
 } from '../internal/types.js'
-import { defineCall } from '../internal/utils.js'
+import {
+  type CallParameters,
+  defineCall,
+  findDeclaredToken,
+  pickWriteParameters,
+  resolveCallParameters,
+  resolveToken,
+  resolveTokenWithDecimals,
+} from '../internal/utils.js'
 import type { TransactionReceipt } from '../Transaction.js'
 
 /**
@@ -50,7 +74,7 @@ import type { TransactionReceipt } from '../Transaction.js'
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -71,27 +95,21 @@ export async function approve<
   client: Client<Transport, chain, account>,
   parameters: approve.Parameters<chain, account>,
 ): Promise<approve.ReturnValue> {
-  const { token, ...rest } = parameters
-  return approve.inner(writeContract, client, parameters, { ...rest, token })
+  return approve.inner(writeContract, client, parameters)
 }
 
 export namespace approve {
+  export type Args = {
+    /** Amount of tokens to approve, in base units or formatted decimal form. */
+    amount: internal_Token.AmountInput
+    /** Address of the spender. */
+    spender: Address
+  } & TokenParameter
   export type Parameters<
     chain extends Chain | undefined = Chain | undefined,
     account extends Account | undefined = Account | undefined,
   > = WriteParameters<chain, account> & Args
-
-  export type Args = {
-    /** Amount of tokens to approve. */
-    amount: bigint
-    /** Address of the spender. */
-    spender: Address
-    /** Address or ID of the TIP20 token. */
-    token: TokenId.TokenIdOrAddress
-  }
-
   export type ReturnValue = WriteContractReturnType
-
   // TODO: exhaustive error type
   export type ErrorType = BaseErrorType
 
@@ -104,58 +122,87 @@ export namespace approve {
     action: action,
     client: Client<Transport, chain, account>,
     parameters: approve.Parameters<chain, account>,
-    args: Args,
   ): Promise<ReturnType<action>> {
-    const call = approve.call(args)
     return (await action(client, {
       ...parameters,
-      ...call,
+      ...approve.call(client, parameters as never),
     } as never)) as never
   }
 
   /**
    * Defines a call to the `approve` function.
    *
-   * Can be passed as a parameter to:
-   * - [`estimateContractGas`](https://viem.sh/docs/contract/estimateContractGas): estimate the gas cost of the call
-   * - [`simulateContract`](https://viem.sh/docs/contract/simulateContract): simulate the call
-   * - [`sendCalls`](https://viem.sh/docs/actions/wallet/sendCalls): send multiple calls
+   * Can be passed as a parameter to `estimateContractGas`, `simulateContract`,
+   * `sendCalls`, `sendTransaction` (`calls`), or `multicall`. The token is
+   * selected by `token`, which is either a TIP20 token id or a contract
+   * `address`; `amount.decimals` is inferred from the client's declared
+   * `tokens` when omitted.
    *
-   * @example
-   * ```ts
-   * import { createClient, http, walletActions } from 'viem'
-   * import { tempo } from 'viem/chains'
-   * import { Actions } from 'viem/tempo'
-   *
-   * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
-   *   transport: http(),
-   * }).extend(walletActions)
-   *
-   * const { result } = await client.sendCalls({
-   *   calls: [
-   *     actions.token.approve.call({
-   *       spender: '0x20c0...beef',
-   *       amount: 100n,
-   *       token: '0x20c0...babe',
-   *     }),
-   *   ]
-   * })
-   * ```
-   *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
-    const { spender, amount, token } = args
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
+    const { amount, spender, token } = args
+    const { address, decimals } = resolveToken(client, { token })
     return defineCall({
-      address: TokenId.toAddress(token),
+      address,
       abi: Abis.tip20,
       functionName: 'approve',
-      args: [spender, amount],
+      args: [spender, internal_Token.toBaseUnits(amount, decimals)],
     })
   }
 
+  /**
+   * Estimates the gas required to approve a spender. `amount.decimals` is
+   * inferred from the client's declared `tokens` when omitted.
+   *
+   * @param client - Client.
+   * @param parameters - Parameters.
+   * @returns The gas estimate.
+   */
+  export async function estimateGas<
+    chain extends Chain | undefined,
+    account extends Account | undefined,
+  >(
+    client: Client<Transport, chain, account>,
+    parameters: approve.Parameters<chain, account>,
+  ): Promise<bigint> {
+    return estimateContractGas(client, {
+      ...pickWriteParameters(parameters as never),
+      ...approve.call(client, parameters as never),
+    } as never)
+  }
+
+  /**
+   * Simulates an approval of a spender. `amount.decimals` is inferred from
+   * the client's declared `tokens` when omitted.
+   *
+   * @param client - Client.
+   * @param parameters - Parameters.
+   * @returns The simulation result and write request.
+   */
+  export async function simulate<
+    chain extends Chain | undefined,
+    account extends Account | undefined,
+  >(
+    client: Client<Transport, chain, account>,
+    parameters: approve.Parameters<chain, account>,
+  ): Promise<SimulateContractReturnType<typeof Abis.tip20, 'approve'>> {
+    return simulateContract(client, {
+      ...pickWriteParameters(parameters as never),
+      ...approve.call(client, parameters as never),
+    } as never) as never
+  }
+
+  /**
+   * Extracts the `Approval` event from logs.
+   *
+   * @param logs - The logs.
+   * @returns The `Approval` event.
+   */
   export function extractEvent(logs: Log[]) {
     const [log] = parseEventLogs({
       abi: Abis.tip20,
@@ -179,7 +226,7 @@ export namespace approve {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -200,28 +247,31 @@ export async function approveSync<
   client: Client<Transport, chain, account>,
   parameters: approveSync.Parameters<chain, account>,
 ): Promise<approveSync.ReturnValue> {
-  const { throwOnReceiptRevert = true, ...rest } = parameters
-  const receipt = await approve.inner(
-    writeContractSync,
-    client,
-    { ...parameters, throwOnReceiptRevert } as never,
-    rest,
-  )
+  const { amount, token, throwOnReceiptRevert = true } = parameters
+  const { decimals } = resolveToken(client, { token })
+  const resolved = internal_Token.resolveAmountDecimals(amount, decimals)
+  const receipt = await approve.inner(writeContractSync, client, {
+    ...parameters,
+    throwOnReceiptRevert,
+  } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = approve.extractEvent(receipt.logs)
   return {
     ...args,
+    ...(resolved === undefined
+      ? {}
+      : { decimals: resolved, formatted: formatUnits(args.amount, resolved) }),
     receipt,
   } as never
 }
 
 export namespace approveSync {
+  export type Args = approve.Args
   export type Parameters<
     chain extends Chain | undefined = Chain | undefined,
     account extends Account | undefined = Account | undefined,
   > = approve.Parameters<chain, account>
-
-  export type Args = approve.Args
-
   export type ReturnValue = Compute<
     GetEventArgs<
       typeof Abis.tip20,
@@ -231,11 +281,14 @@ export namespace approveSync {
         Required: true
       }
     > & {
+      /** Token decimals used to derive `formatted`, if known. */
+      decimals?: number | undefined
+      /** Approved amount formatted with the token's `decimals`, if known. */
+      formatted?: string | undefined
       /** Transaction receipt. */
       receipt: TransactionReceipt
     }
   >
-
   // TODO: exhaustive error type
   export type ErrorType = BaseErrorType
 }
@@ -252,7 +305,7 @@ export namespace approveSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -278,19 +331,17 @@ export async function burnBlocked<
 }
 
 export namespace burnBlocked {
+  export type Args = {
+    /** Amount of tokens to burn, in base units or formatted decimal form. */
+    amount: internal_Token.AmountInput
+    /** Address to burn tokens from. */
+    from: Address
+  } & TokenParameter
+
   export type Parameters<
     chain extends Chain | undefined = Chain | undefined,
     account extends Account | undefined = Account | undefined,
   > = WriteParameters<chain, account> & Args
-
-  export type Args = {
-    /** Amount of tokens to burn. */
-    amount: bigint
-    /** Address to burn tokens from. */
-    from: Address
-    /** Address or ID of the TIP20 token. */
-    token: TokenId.TokenIdOrAddress
-  }
 
   export type ReturnValue = WriteContractReturnType
 
@@ -308,7 +359,7 @@ export namespace burnBlocked {
     parameters: burnBlocked.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { amount, from, token, ...rest } = parameters
-    const call = burnBlocked.call({ amount, from, token })
+    const call = burnBlocked.call(client, { amount, from, token } as never)
     return (await action(client, {
       ...rest,
       ...call,
@@ -330,13 +381,13 @@ export namespace burnBlocked {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.burnBlocked.call({
+   *     actions.token.burnBlocked.call(client, {
    *       from: '0x20c0...beef',
    *       amount: 100n,
    *       token: '0x20c0...babe',
@@ -345,16 +396,22 @@ export namespace burnBlocked {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * `amount.decimals` is inferred from the client's declared `tokens` when omitted.
+   *
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { from, amount, token } = args
+    const { address, decimals } = resolveToken(client, { token })
     return defineCall({
-      address: TokenId.toAddress(token),
+      address,
       abi: Abis.tip20,
       functionName: 'burnBlocked',
-      args: [from, amount],
+      args: [from, internal_Token.toBaseUnits(amount, decimals)],
     })
   }
 
@@ -387,7 +444,7 @@ export namespace burnBlocked {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -414,6 +471,8 @@ export async function burnBlockedSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = burnBlocked.extractEvent(receipt.logs)
   return {
     ...args,
@@ -459,7 +518,7 @@ export namespace burnBlockedSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -484,19 +543,17 @@ export async function burn<
 }
 
 export namespace burn {
+  export type Args = {
+    /** Amount of tokens to burn, in base units or formatted decimal form. */
+    amount: internal_Token.AmountInput
+    /** Memo to include in the transfer. */
+    memo?: Hex.Hex | undefined
+  } & TokenParameter
+
   export type Parameters<
     chain extends Chain | undefined = Chain | undefined,
     account extends Account | undefined = Account | undefined,
   > = WriteParameters<chain, account> & Args
-
-  export type Args = {
-    /** Amount of tokens to burn. */
-    amount: bigint
-    /** Memo to include in the transfer. */
-    memo?: Hex.Hex | undefined
-    /** Address or ID of the TIP20 token. */
-    token: TokenId.TokenIdOrAddress
-  }
 
   export type ReturnValue = WriteContractReturnType
 
@@ -514,7 +571,7 @@ export namespace burn {
     parameters: burn.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { amount, memo, token, ...rest } = parameters
-    const call = burn.call({ amount, memo, token })
+    const call = burn.call(client, { amount, memo, token } as never)
     return (await action(client, {
       ...rest,
       ...call,
@@ -536,13 +593,13 @@ export namespace burn {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.burn.call({
+   *     actions.token.burn.call(client, {
    *       amount: 100n,
    *       token: '0x20c0...babe',
    *     }),
@@ -550,22 +607,29 @@ export namespace burn {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * `amount.decimals` is inferred from the client's declared `tokens` when omitted.
+   *
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { amount, memo, token } = args
+    const { address, decimals } = resolveToken(client, { token })
+    const value = internal_Token.toBaseUnits(amount, decimals)
     const callArgs = memo
       ? ({
           functionName: 'burnWithMemo',
-          args: [amount, Hex.padLeft(memo, 32)],
+          args: [value, Hex.padLeft(memo, 32)],
         } as const)
       : ({
           functionName: 'burn',
-          args: [amount],
+          args: [value],
         } as const)
     return defineCall({
-      address: TokenId.toAddress(token),
+      address,
       abi: Abis.tip20,
       ...callArgs,
     })
@@ -600,7 +664,7 @@ export namespace burn {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -626,6 +690,8 @@ export async function burnSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = burn.extractEvent(receipt.logs)
   return {
     ...args,
@@ -670,7 +736,7 @@ export namespace burnSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -723,7 +789,7 @@ export namespace changeTransferPolicy {
     parameters: changeTransferPolicy.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { policyId, token, ...rest } = parameters
-    const call = changeTransferPolicy.call({ policyId, token })
+    const call = changeTransferPolicy.call(client, { policyId, token })
     return (await action(client, {
       ...rest,
       ...call,
@@ -745,13 +811,13 @@ export namespace changeTransferPolicy {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.changeTransferPolicy.call({
+   *     actions.token.changeTransferPolicy.call(client, {
    *       token: '0x20c0...babe',
    *       policyId: 1n,
    *     }),
@@ -759,13 +825,16 @@ export namespace changeTransferPolicy {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token, policyId } = args
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'changeTransferPolicyId',
       args: [policyId],
@@ -801,7 +870,7 @@ export namespace changeTransferPolicy {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -827,6 +896,8 @@ export async function changeTransferPolicySync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = changeTransferPolicy.extractEvent(receipt.logs)
   return {
     ...args,
@@ -871,7 +942,7 @@ export namespace changeTransferPolicySync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -879,6 +950,7 @@ export namespace changeTransferPolicySync {
  *   name: 'My Token',
  *   symbol: 'MTK',
  *   currency: 'USD',
+ *   logoURI: 'https://example.com/token.svg',
  * })
  * ```
  *
@@ -913,6 +985,8 @@ export namespace create {
     currency: string
     /** Token name. */
     name: string
+    /** Logo URI. Requires a T5-enabled Tempo chain. */
+    logoURI?: string | undefined
     /** Quote token. */
     quoteToken?: TokenId.TokenIdOrAddress | undefined
     /** Unique salt. @default Hex.random(32) */
@@ -945,7 +1019,7 @@ export namespace create {
     const admin = admin_ ? parseAccount(admin_) : undefined
     if (!admin) throw new Error('admin is required.')
 
-    const call = create.call({ ...rest, admin: admin.address })
+    const call = create.call(client, { ...rest, admin: admin.address })
 
     return (await action(
       client as never,
@@ -973,30 +1047,35 @@ export namespace create {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.create.call({
+   *     actions.token.create.call(client, {
    *       name: 'My Token',
    *       symbol: 'MTK',
    *       currency: 'USD',
+   *       logoURI: 'https://example.com/token.svg',
    *       admin: '0xfeed...fede',
    *     }),
    *   ]
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const {
       name,
       symbol,
       currency,
+      logoURI,
       quoteToken = Addresses.pathUsd,
       admin,
       salt = Hex.random(32),
@@ -1004,14 +1083,25 @@ export namespace create {
     return defineCall({
       address: Addresses.tip20Factory,
       abi: Abis.tip20Factory,
-      args: [
-        name,
-        symbol,
-        currency,
-        TokenId.toAddress(quoteToken),
-        admin,
-        salt,
-      ],
+      args:
+        typeof logoURI === 'string'
+          ? [
+              name,
+              symbol,
+              currency,
+              resolveToken(client, { token: quoteToken }).address,
+              admin,
+              salt,
+              logoURI,
+            ]
+          : [
+              name,
+              symbol,
+              currency,
+              resolveToken(client, { token: quoteToken }).address,
+              admin,
+              salt,
+            ],
       functionName: 'createToken',
     })
   }
@@ -1046,7 +1136,7 @@ export namespace create {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -1054,6 +1144,7 @@ export namespace create {
  *   name: 'My Token',
  *   symbol: 'MTK',
  *   currency: 'USD',
+ *   logoURI: 'https://example.com/token.svg',
  * })
  * ```
  *
@@ -1073,6 +1164,9 @@ export async function createSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
 
   const { args } = create.extractEvent(receipt.logs)
   const tokenId = TokenId.fromAddress(args.token)
@@ -1121,68 +1215,68 @@ export namespace createSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
  * const allowance = await Actions.token.getAllowance(client, {
+ *   account: '0x...',
  *   spender: '0x...',
+ *   token: '0x...',
  * })
  * ```
  *
  * @param client - Client.
  * @param parameters - Parameters.
- * @returns The token allowance.
+ * @returns The token allowance, in base units and human-readable form.
  */
-export async function getAllowance<
-  chain extends Chain | undefined,
-  account extends Account | undefined,
->(
-  client: Client<Transport, chain, account>,
-  parameters: getAllowance.Parameters<account>,
+export async function getAllowance<chain extends Chain | undefined>(
+  client: Client<Transport, chain>,
+  parameters: getAllowance.Parameters,
 ): Promise<getAllowance.ReturnValue> {
-  const { account = client.account } = parameters
-  const address = account ? parseAccount(account).address : undefined
-  if (!address) throw new Error('account is required.')
-  return readContract(client, {
-    ...parameters,
-    ...getAllowance.call({ ...parameters, account: address }),
-  })
+  const { account, decimals, spender, token, ...rest } = parameters
+  const [amount, { decimals: resolved }] = await Promise.all([
+    readContract(client, {
+      ...rest,
+      ...getAllowance.call(client, { account, spender, token } as never),
+    }),
+    resolveTokenWithDecimals(client, {
+      decimals,
+      token,
+    }),
+  ])
+  return internal_Token.toAmount(amount, resolved)
 }
 
 export namespace getAllowance {
-  export type Parameters<
-    account extends Account | undefined = Account | undefined,
-  > = ReadParameters & GetAccountParameter<account> & Omit<Args, 'account'> & {}
-
   export type Args = {
-    /** Account address. */
+    /** Account that owns the tokens. */
     account: Address
-    /** Address of the spender. */
+    /** Spender of the tokens. */
     spender: Address
-    /** Address or ID of the TIP20 token. */
-    token: TokenId.TokenIdOrAddress
-  }
-
-  export type ReturnValue = ReadContractReturnType<
-    typeof Abis.tip20,
-    'allowance',
-    never
-  >
+  } & TokenParameters
+  export type Parameters = ReadParameters & Args
+  export type ReturnValue = internal_Token.Amount
 
   /**
    * Defines a call to the `allowance` function.
    *
-   * @param args - Arguments.
+   * Can be passed as a parameter to `multicall`, `simulateContract`, or any
+   * other action that accepts a contract call. The token is selected by `token`,
+   * which is either a TIP20 token id or a contract address.
+   *
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
-    const { account, spender, token } = args
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, args).address,
       abi: Abis.tip20,
       functionName: 'allowance',
-      args: [account, spender],
+      args: [args.account, args.spender],
     })
   }
 }
@@ -1199,18 +1293,19 @@ export namespace getAllowance {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
  * const balance = await Actions.token.getBalance(client, {
+ *   account: '0x...',
  *   token: '0x...',
  * })
  * ```
  *
  * @param client - Client.
  * @param parameters - Parameters.
- * @returns The token balance.
+ * @returns The token balance, in base units and human-readable form.
  */
 export async function getBalance<
   chain extends Chain | undefined,
@@ -1219,43 +1314,60 @@ export async function getBalance<
   client: Client<Transport, chain, account>,
   parameters: getBalance.Parameters<account>,
 ): Promise<getBalance.ReturnValue> {
-  const { account = client.account, ...rest } = parameters
-  const address = account ? parseAccount(account).address : undefined
-  if (!address) throw new Error('account is required.')
-  return readContract(client, {
-    ...rest,
-    ...getBalance.call({ account: address, ...rest }),
-  })
+  const {
+    account: account_ = client.account,
+    decimals,
+    token,
+    ...rest
+  } = parameters
+  if (!account_) throw new AccountNotFoundError()
+  const account = parseAccount(account_).address
+  const [amount, { decimals: resolved }] = await Promise.all([
+    readContract(client, {
+      ...rest,
+      ...getBalance.call(client, { account, token } as never),
+    }),
+    resolveTokenWithDecimals(client, {
+      decimals,
+      token,
+    }),
+  ])
+  return internal_Token.toAmount(amount, resolved)
 }
 
 export namespace getBalance {
+  export type Args<account extends Account | undefined = Account | undefined> =
+    GetAccountParameter<account, Account | Address> & TokenParameters
   export type Parameters<
     account extends Account | undefined = Account | undefined,
-  > = ReadParameters & GetAccountParameter<account> & Omit<Args, 'account'>
-
-  export type Args = {
-    /** Account address. */
-    account: Address
-    /** Address or ID of the TIP20 token. */
-    token: TokenId.TokenIdOrAddress
-  }
-
-  export type ReturnValue = ReadContractReturnType<
-    typeof Abis.tip20,
-    'balanceOf',
-    never
-  >
+  > = Omit<ReadParameters, 'account'> & Args<account>
+  export type ReturnValue = internal_Token.Amount
 
   /**
    * Defines a call to the `balanceOf` function.
    *
-   * @param args - Arguments.
+   * Can be passed as a parameter to `multicall`, `simulateContract`, or any
+   * other action that accepts a contract call. The token is selected by `token`,
+   * which is either a TIP20 token id or a contract address.
+   *
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
-    const { account, token } = args
+  export function call<
+    chain extends Chain | undefined,
+    account extends Account | undefined,
+  >(
+    ...parameters: CallParameters<
+      Args<account>,
+      Client<Transport, chain, account>
+    >
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
+    const account_ = args.account ?? client?.account
+    if (!account_) throw new AccountNotFoundError()
+    const account = parseAccount(account_).address
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, args).address,
       abi: Abis.tip20,
       functionName: 'balanceOf',
       args: [account],
@@ -1264,7 +1376,7 @@ export namespace getBalance {
 }
 
 /**
- * Gets TIP20 token metadata including name, symbol, currency, decimals, and total supply.
+ * Gets TIP20 token metadata including name, symbol, logo URI, currency, decimals, and total supply.
  *
  * @example
  * ```ts
@@ -1275,7 +1387,7 @@ export namespace getBalance {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -1293,11 +1405,18 @@ export async function getMetadata<chain extends Chain | undefined>(
   parameters: getMetadata.Parameters,
 ): Promise<getMetadata.ReturnValue> {
   const { token, ...rest } = parameters
-  const address = TokenId.toAddress(token)
+  const { address } = resolveToken(client, { token })
   const abi = Abis.tip20
 
-  if (TokenId.from(token) === TokenId.fromAddress(Addresses.pathUsd))
-    return multicall(client, {
+  const declared = findDeclaredToken(client, token)
+  const overrides = {
+    ...(declared?.decimals != null ? { decimals: declared.decimals } : {}),
+    ...(declared?.name != null ? { name: declared.name } : {}),
+    ...(declared?.symbol != null ? { symbol: declared.symbol } : {}),
+  }
+
+  if (TokenId.fromAddress(address) === TokenId.fromAddress(Addresses.pathUsd))
+    return readMetadataContracts(client, {
       ...rest,
       contracts: [
         {
@@ -1309,6 +1428,11 @@ export async function getMetadata<chain extends Chain | undefined>(
           address,
           abi,
           functionName: 'decimals',
+        },
+        {
+          address,
+          abi,
+          functionName: 'logoURI',
         },
         {
           address,
@@ -1326,17 +1450,17 @@ export async function getMetadata<chain extends Chain | undefined>(
           functionName: 'totalSupply',
         },
       ] as const,
-      allowFailure: false,
-      deployless: true,
-    }).then(([currency, decimals, name, symbol, totalSupply]) => ({
-      name,
-      symbol,
-      currency,
-      decimals,
-      totalSupply,
+    }).then(([currency, decimals, logoURI, name, symbol, totalSupply]) => ({
+      name: unwrapMulticallResult(name),
+      symbol: unwrapMulticallResult(symbol),
+      currency: unwrapMulticallResult(currency),
+      decimals: unwrapMulticallResult(decimals),
+      logoURI: unwrapMulticallResult(logoURI, ''),
+      totalSupply: unwrapMulticallResult(totalSupply),
+      ...overrides,
     }))
 
-  return multicall(client, {
+  return readMetadataContracts(client, {
     ...rest,
     contracts: [
       {
@@ -1348,6 +1472,11 @@ export async function getMetadata<chain extends Chain | undefined>(
         address,
         abi,
         functionName: 'decimals',
+      },
+      {
+        address,
+        abi,
+        functionName: 'logoURI',
       },
       {
         address,
@@ -1385,12 +1514,11 @@ export async function getMetadata<chain extends Chain | undefined>(
         functionName: 'transferPolicyId',
       },
     ] as const,
-    allowFailure: false,
-    deployless: true,
   }).then(
     ([
       currency,
       decimals,
+      logoURI,
       quoteToken,
       name,
       paused,
@@ -1399,24 +1527,96 @@ export async function getMetadata<chain extends Chain | undefined>(
       totalSupply,
       transferPolicyId,
     ]) => ({
-      name,
-      symbol,
-      currency,
-      decimals,
-      quoteToken,
-      totalSupply,
-      paused,
-      supplyCap,
-      transferPolicyId,
+      name: unwrapMulticallResult(name),
+      symbol: unwrapMulticallResult(symbol),
+      currency: unwrapMulticallResult(currency),
+      decimals: unwrapMulticallResult(decimals),
+      logoURI: unwrapMulticallResult(logoURI, ''),
+      quoteToken: unwrapMulticallResult(quoteToken),
+      totalSupply: unwrapMulticallResult(totalSupply),
+      paused: unwrapMulticallResult(paused),
+      supplyCap: unwrapMulticallResult(supplyCap),
+      transferPolicyId: unwrapMulticallResult(transferPolicyId),
+      ...overrides,
     }),
   )
 }
 
-export declare namespace getMetadata {
-  export type Parameters = {
-    /** Address or ID of the TIP20 token. */
-    token: TokenId.TokenIdOrAddress
+async function readMetadataContracts<
+  chain extends Chain | undefined,
+  const contracts extends readonly unknown[],
+>(
+  client: Client<Transport, chain>,
+  parameters: Pick<
+    MulticallParameters<contracts>,
+    | 'blockNumber'
+    | 'blockOverrides'
+    | 'blockTag'
+    | 'contracts'
+    | 'stateOverride'
+  >,
+): Promise<MulticallReturnType<contracts>>
+async function readMetadataContracts<chain extends Chain | undefined>(
+  client: Client<Transport, chain>,
+  parameters: Pick<
+    MulticallParameters,
+    | 'blockNumber'
+    | 'blockOverrides'
+    | 'blockTag'
+    | 'contracts'
+    | 'stateOverride'
+  >,
+): Promise<MulticallReturnType> {
+  // Preserve the action's deployless default unless the client overrides it.
+  if (client.batch?.multicall === undefined)
+    return multicall(client, {
+      ...parameters,
+      allowFailure: true,
+      deployless: true,
+    })
+
+  const { contracts, ...rest } = parameters
+  const results = await Promise.allSettled(
+    contracts.map((contract) =>
+      readContract(client, {
+        ...rest,
+        ...contract,
+      }),
+    ),
+  )
+  return results.map((result) =>
+    result.status === 'fulfilled'
+      ? { result: result.value, status: 'success' }
+      : { error: result.reason, status: 'failure' },
+  )
+}
+
+function unwrapMulticallResult<result>(
+  response:
+    | { result: result; status: 'success' }
+    | { error: unknown; status: 'failure' },
+): result
+function unwrapMulticallResult<result>(
+  response:
+    | { result: result; status: 'success' }
+    | { error: unknown; status: 'failure' },
+  fallback: result,
+): result
+function unwrapMulticallResult<result>(
+  response:
+    | { result: result; status: 'success' }
+    | { error: unknown; status: 'failure' },
+  ...fallback: [] | [result]
+) {
+  if (response.status === 'failure') {
+    if (fallback.length > 0) return fallback[0]
+    throw response.error
   }
+  return response.result
+}
+
+export declare namespace getMetadata {
+  export type Parameters = Omit<ReadParameters, 'account'> & TokenParameter
 
   export type ReturnValue = Compute<{
     /**
@@ -1427,6 +1627,11 @@ export declare namespace getMetadata {
      * Decimals of the token.
      */
     decimals: number
+    /**
+     * Logo URI of the token. Returns an empty string if unset or unsupported
+     * by the active Tempo hardfork.
+     */
+    logoURI: string
     /**
      * Quote token.
      *
@@ -1468,6 +1673,75 @@ export declare namespace getMetadata {
 }
 
 /**
+ * Gets the total supply of a TIP20 token.
+ *
+ * @example
+ * ```ts
+ * import { createClient, http } from 'viem'
+ * import { tempo } from 'viem/chains'
+ * import { Actions } from 'viem/tempo'
+ *
+ * const client = createClient({
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   transport: http(),
+ * })
+ *
+ * const totalSupply = await Actions.token.getTotalSupply(client, {
+ *   token: '0x...',
+ * })
+ * ```
+ *
+ * @param client - Client.
+ * @param parameters - Parameters.
+ * @returns The token total supply, in base units and human-readable form.
+ */
+export async function getTotalSupply<chain extends Chain | undefined>(
+  client: Client<Transport, chain>,
+  parameters: getTotalSupply.Parameters,
+): Promise<getTotalSupply.ReturnValue> {
+  const { decimals, token, ...rest } = parameters
+  const [amount, { decimals: resolved }] = await Promise.all([
+    readContract(client, {
+      ...rest,
+      ...getTotalSupply.call(client, { token } as never),
+    }),
+    resolveTokenWithDecimals(client, {
+      decimals,
+      token,
+    }),
+  ])
+  return internal_Token.toAmount(amount, resolved)
+}
+
+export namespace getTotalSupply {
+  export type Args = TokenParameters
+  export type Parameters = Omit<ReadParameters, 'account'> & Args
+  export type ReturnValue = internal_Token.Amount
+
+  /**
+   * Defines a call to the `totalSupply` function.
+   *
+   * Can be passed as a parameter to `multicall`, `simulateContract`, or any
+   * other action that accepts a contract call. The token is selected by `token`,
+   * which is either a TIP20 token id or a contract address.
+   *
+   * @param parameters - Client (optional), followed by the call arguments.
+   * @returns The call.
+   */
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
+    return defineCall({
+      address: resolveToken(client, args).address,
+      abi: Abis.tip20,
+      args: [],
+      functionName: 'totalSupply',
+    })
+  }
+}
+
+/**
  * Gets the admin role for a specific role in a TIP20 token.
  *
  * @example
@@ -1477,7 +1751,7 @@ export declare namespace getMetadata {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -1497,7 +1771,7 @@ export async function getRoleAdmin<chain extends Chain | undefined>(
 ): Promise<getRoleAdmin.ReturnValue> {
   return readContract(client, {
     ...parameters,
-    ...getRoleAdmin.call(parameters),
+    ...getRoleAdmin.call(client, parameters),
   })
 }
 
@@ -1520,13 +1794,16 @@ export namespace getRoleAdmin {
   /**
    * Defines a call to the `getRoleAdmin` function.
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { role, token } = args
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'getRoleAdmin',
       args: [TokenRole.serialize(role)],
@@ -1544,7 +1821,7 @@ export namespace getRoleAdmin {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -1571,7 +1848,7 @@ export async function hasRole<
   if (!address) throw new Error('account is required.')
   return readContract(client, {
     ...parameters,
-    ...hasRole.call({ ...parameters, account: address }),
+    ...hasRole.call(client, { ...parameters, account: address }),
   })
 }
 
@@ -1598,13 +1875,16 @@ export namespace hasRole {
   /**
    * Defines a call to the `hasRole` function.
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { account, role, token } = args
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'hasRole',
       args: [account, TokenRole.serialize(role)],
@@ -1624,7 +1904,7 @@ export namespace hasRole {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -1686,7 +1966,7 @@ export namespace grantRoles {
     return (await action(client, {
       ...parameters,
       calls: parameters.roles.map((role) => {
-        const call = grantRoles.call({ ...parameters, role })
+        const call = grantRoles.call(client, { ...parameters, role })
         return {
           ...call,
           data: encodeFunctionData(call),
@@ -1710,13 +1990,13 @@ export namespace grantRoles {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.grantRoles.call({
+   *     actions.token.grantRoles.call(client, {
    *       token: '0x20c0...babe',
    *       to: '0x20c0...beef',
    *       role: 'issuer',
@@ -1725,14 +2005,17 @@ export namespace grantRoles {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token, to, role } = args
     const roleHash = TokenRole.serialize(role)
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'grantRole',
       args: [roleHash, to],
@@ -1769,7 +2052,7 @@ export namespace grantRoles {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -1796,6 +2079,8 @@ export async function grantRolesSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const events = grantRoles.extractEvents(receipt.logs)
   const value = events.map((event) => event.args)
   return {
@@ -1837,7 +2122,7 @@ export namespace grantRolesSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -1863,21 +2148,19 @@ export async function mint<
 }
 
 export namespace mint {
-  export type Parameters<
-    chain extends Chain | undefined = Chain | undefined,
-    account extends Account | undefined = Account | undefined,
-  > = WriteParameters<chain, account> & Args
-
   export type Args = {
-    /** Amount of tokens to mint. */
-    amount: bigint
+    /** Amount of tokens to mint, in base units or formatted decimal form. */
+    amount: internal_Token.AmountInput
     /** Memo to include in the mint. */
     memo?: Hex.Hex | undefined
     /** Address to mint tokens to. */
     to: Address
-    /** Address or ID of the TIP20 token. */
-    token: TokenId.TokenIdOrAddress
-  }
+  } & TokenParameter
+
+  export type Parameters<
+    chain extends Chain | undefined = Chain | undefined,
+    account extends Account | undefined = Account | undefined,
+  > = WriteParameters<chain, account> & Args
 
   export type ReturnValue = WriteContractReturnType
 
@@ -1892,11 +2175,12 @@ export namespace mint {
   >(
     action: action,
     client: Client<Transport, chain, account>,
-    parameters: any,
+    parameters: mint.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
-    const call = mint.call(parameters)
+    const { amount, memo, to, token, ...rest } = parameters
+    const call = mint.call(client, { amount, memo, to, token } as never)
     return (await action(client, {
-      ...parameters,
+      ...rest,
       ...call,
     } as never)) as never
   }
@@ -1916,13 +2200,13 @@ export namespace mint {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.mint.call({
+   *     actions.token.mint.call(client, {
    *       to: '0x20c0...beef',
    *       amount: 100n,
    *       token: '0x20c0...babe',
@@ -1931,22 +2215,29 @@ export namespace mint {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * `amount.decimals` is inferred from the client's declared `tokens` when omitted.
+   *
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { to, amount, memo, token } = args
+    const { address, decimals } = resolveToken(client, { token })
+    const value = internal_Token.toBaseUnits(amount, decimals)
     const callArgs = memo
       ? ({
           functionName: 'mintWithMemo',
-          args: [to, amount, Hex.padLeft(memo, 32)],
+          args: [to, value, Hex.padLeft(memo, 32)],
         } as const)
       : ({
           functionName: 'mint',
-          args: [to, amount],
+          args: [to, value],
         } as const)
     return defineCall({
-      address: TokenId.toAddress(token),
+      address,
       abi: Abis.tip20,
       ...callArgs,
     })
@@ -1981,7 +2272,7 @@ export namespace mint {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2008,6 +2299,8 @@ export async function mintSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = mint.extractEvent(receipt.logs)
   return {
     ...args,
@@ -2052,7 +2345,7 @@ export namespace mintSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2102,7 +2395,7 @@ export namespace pause {
     parameters: pause.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { token, ...rest } = parameters
-    const call = pause.call({ token })
+    const call = pause.call(client, { token })
     return (await action(client, {
       ...rest,
       ...call,
@@ -2124,26 +2417,29 @@ export namespace pause {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.pause.call({
+   *     actions.token.pause.call(client, {
    *       token: '0x20c0...babe',
    *     }),
    *   ]
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token } = args
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'pause',
       args: [],
@@ -2179,7 +2475,7 @@ export namespace pause {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2204,6 +2500,8 @@ export async function pauseSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = pause.extractEvent(receipt.logs)
   return {
     ...args,
@@ -2243,7 +2541,7 @@ export namespace pauseSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2302,7 +2600,7 @@ export namespace renounceRoles {
     return (await action(client, {
       ...parameters,
       calls: parameters.roles.map((role) => {
-        const call = renounceRoles.call({ ...parameters, role })
+        const call = renounceRoles.call(client, { ...parameters, role })
         return {
           ...call,
           data: encodeFunctionData(call),
@@ -2326,13 +2624,13 @@ export namespace renounceRoles {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.renounceRoles.call({
+   *     actions.token.renounceRoles.call(client, {
    *       token: '0x20c0...babe',
    *       role: 'issuer',
    *     }),
@@ -2340,14 +2638,17 @@ export namespace renounceRoles {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token, role } = args
     const roleHash = TokenRole.serialize(role)
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'renounceRole',
       args: [roleHash],
@@ -2384,7 +2685,7 @@ export namespace renounceRoles {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2410,6 +2711,8 @@ export async function renounceRolesSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const events = renounceRoles.extractEvents(receipt.logs)
   const value = events.map((event) => event.args)
   return {
@@ -2451,7 +2754,7 @@ export namespace renounceRolesSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2514,7 +2817,7 @@ export namespace revokeRoles {
     return (await action(client, {
       ...rest,
       calls: parameters.roles.map((role) => {
-        const call = revokeRoles.call({ ...parameters, role })
+        const call = revokeRoles.call(client, { ...parameters, role })
         return {
           ...call,
           data: encodeFunctionData(call),
@@ -2538,13 +2841,13 @@ export namespace revokeRoles {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.revokeRoles.call({
+   *     actions.token.revokeRoles.call(client, {
    *       token: '0x20c0...babe',
    *       from: '0x20c0...beef',
    *       role: 'issuer',
@@ -2553,14 +2856,17 @@ export namespace revokeRoles {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token, from, role } = args
     const roleHash = TokenRole.serialize(role)
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'revokeRole',
       args: [roleHash, from],
@@ -2597,7 +2903,7 @@ export namespace revokeRoles {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2624,6 +2930,8 @@ export async function revokeRolesSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const events = revokeRoles.extractEvents(receipt.logs)
   const value = events.map((event) => event.args)
   return {
@@ -2665,7 +2973,7 @@ export namespace revokeRolesSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2718,7 +3026,7 @@ export namespace setSupplyCap {
     parameters: setSupplyCap.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { supplyCap, token, ...rest } = parameters
-    const call = setSupplyCap.call({ supplyCap, token })
+    const call = setSupplyCap.call(client, { supplyCap, token })
     return (await action(client, {
       ...rest,
       ...call,
@@ -2740,13 +3048,13 @@ export namespace setSupplyCap {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.setSupplyCap.call({
+   *     actions.token.setSupplyCap.call(client, {
    *       token: '0x20c0...babe',
    *       supplyCap: 1000000n,
    *     }),
@@ -2754,13 +3062,16 @@ export namespace setSupplyCap {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token, supplyCap } = args
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'setSupplyCap',
       args: [supplyCap],
@@ -2796,7 +3107,7 @@ export namespace setSupplyCap {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2822,6 +3133,8 @@ export async function setSupplyCapSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = setSupplyCap.extractEvent(receipt.logs)
   return {
     ...args,
@@ -2861,7 +3174,7 @@ export namespace setSupplyCapSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -2917,7 +3230,7 @@ export namespace setRoleAdmin {
     parameters: setRoleAdmin.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { adminRole, role, token, ...rest } = parameters
-    const call = setRoleAdmin.call({ adminRole, role, token })
+    const call = setRoleAdmin.call(client, { adminRole, role, token })
     return (await action(client, {
       ...rest,
       ...call,
@@ -2939,13 +3252,13 @@ export namespace setRoleAdmin {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.setRoleAdmin.call({
+   *     actions.token.setRoleAdmin.call(client, {
    *       token: '0x20c0...babe',
    *       role: 'issuer',
    *       adminRole: 'admin',
@@ -2954,15 +3267,18 @@ export namespace setRoleAdmin {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token, role, adminRole } = args
     const roleHash = TokenRole.serialize(role)
     const adminRoleHash = TokenRole.serialize(adminRole)
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'setRoleAdmin',
       args: [roleHash, adminRoleHash],
@@ -2998,7 +3314,7 @@ export namespace setRoleAdmin {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3025,6 +3341,8 @@ export async function setRoleAdminSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = setRoleAdmin.extractEvent(receipt.logs)
   return {
     ...args,
@@ -3064,7 +3382,7 @@ export namespace setRoleAdminSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3089,26 +3407,21 @@ export async function transfer<
 }
 
 export namespace transfer {
+  export type Args = {
+    /** Amount of tokens to transfer, in base units or formatted decimal form. */
+    amount: internal_Token.AmountInput
+    /** Address to transfer tokens from (uses an allowance via `transferFrom`). */
+    from?: Address | undefined
+    /** Memo to include in the transfer. */
+    memo?: Hex.Hex | undefined
+    /** Address to transfer tokens to. */
+    to: Address
+  } & TokenParameter
   export type Parameters<
     chain extends Chain | undefined = Chain | undefined,
     account extends Account | undefined = Account | undefined,
   > = WriteParameters<chain, account> & Args
-
-  export type Args = {
-    /** Amount of tokens to transfer. */
-    amount: bigint
-    /** Address to transfer tokens from. */
-    from?: Address | undefined
-    /** Memo to include in the transfer. */
-    memo?: Hex.Hex | undefined
-    /** Address or ID of the TIP20 token. */
-    token: TokenId.TokenIdOrAddress
-    /** Address to transfer tokens to. */
-    to: Address
-  }
-
   export type ReturnValue = WriteContractReturnType
-
   // TODO: exhaustive error type
   export type ErrorType = BaseErrorType
 
@@ -3122,82 +3435,112 @@ export namespace transfer {
     client: Client<Transport, chain, account>,
     parameters: transfer.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
-    const { amount, from, memo, token, to, ...rest } = parameters
-    const call = transfer.call({ amount, from, memo, token, to })
     return (await action(client, {
-      ...rest,
-      ...call,
+      ...parameters,
+      ...transfer.call(client, parameters as never),
     } as never)) as never
   }
 
   /**
-   * Defines a call to the `transfer`, `transferFrom`, `transferWithMemo`, or `transferFromWithMemo` function.
+   * Defines a call to the `transfer`, `transferFrom`, `transferWithMemo`, or
+   * `transferFromWithMemo` function.
    *
-   * Can be passed as a parameter to:
-   * - [`estimateContractGas`](https://viem.sh/docs/contract/estimateContractGas): estimate the gas cost of the call
-   * - [`simulateContract`](https://viem.sh/docs/contract/simulateContract): simulate the call
-   * - [`sendCalls`](https://viem.sh/docs/actions/wallet/sendCalls): send multiple calls
+   * Can be passed as a parameter to `estimateContractGas`, `simulateContract`,
+   * `sendCalls`, `sendTransaction` (`calls`), or `multicall`. The token is
+   * selected by `token`, which is either a TIP20 token id or a contract
+   * `address`; `amount.decimals` is inferred from the client's declared
+   * `tokens` when omitted.
    *
-   * @example
-   * ```ts
-   * import { createClient, http, walletActions } from 'viem'
-   * import { tempo } from 'viem/chains'
-   * import { Actions } from 'viem/tempo'
-   *
-   * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
-   *   transport: http(),
-   * }).extend(walletActions)
-   *
-   * const { result } = await client.sendCalls({
-   *   calls: [
-   *     actions.token.transfer.call({
-   *       to: '0x20c0...beef',
-   *       amount: 100n,
-   *       token: '0x20c0...babe',
-   *     }),
-   *   ]
-   * })
-   * ```
-   *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
-    const { amount, from, memo, token, to } = args
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
+    const { from, memo, to, token } = args
+    const { address, decimals } = resolveToken(client, { token })
+    const value = internal_Token.toBaseUnits(args.amount, decimals)
     const callArgs = (() => {
       if (memo && from)
         return {
           functionName: 'transferFromWithMemo',
-          args: [from, to, amount, Hex.padLeft(memo, 32)],
+          args: [from, to, value, Hex.padLeft(memo, 32)],
         } as const
       if (memo)
         return {
           functionName: 'transferWithMemo',
-          args: [to, amount, Hex.padLeft(memo, 32)],
+          args: [to, value, Hex.padLeft(memo, 32)],
         } as const
       if (from)
         return {
           functionName: 'transferFrom',
-          args: [from, to, amount],
+          args: [from, to, value],
         } as const
       return {
         functionName: 'transfer',
-        args: [to, amount],
+        args: [to, value],
       } as const
     })()
     return defineCall({
-      address: TokenId.toAddress(token),
+      address,
       abi: Abis.tip20,
       ...callArgs,
     })
   }
 
   /**
-   * Extracts the event from the logs.
+   * Estimates the gas required to transfer TIP20 tokens. `amount.decimals` is
+   * inferred from the client's declared `tokens` when omitted.
+   *
+   * @param client - Client.
+   * @param parameters - Parameters.
+   * @returns The gas estimate.
+   */
+  export async function estimateGas<
+    chain extends Chain | undefined,
+    account extends Account | undefined,
+  >(
+    client: Client<Transport, chain, account>,
+    parameters: transfer.Parameters<chain, account>,
+  ): Promise<bigint> {
+    return estimateContractGas(client, {
+      ...pickWriteParameters(parameters as never),
+      ...transfer.call(client, parameters as never),
+    } as never)
+  }
+
+  /**
+   * Simulates a transfer of TIP20 tokens. `amount.decimals` is inferred from
+   * the client's declared `tokens` when omitted.
+   *
+   * @param client - Client.
+   * @param parameters - Parameters.
+   * @returns The simulation result and write request.
+   */
+  export async function simulate<
+    chain extends Chain | undefined,
+    account extends Account | undefined,
+  >(
+    client: Client<Transport, chain, account>,
+    parameters: transfer.Parameters<chain, account>,
+  ): Promise<
+    SimulateContractReturnType<
+      typeof Abis.tip20,
+      'transfer' | 'transferFrom' | 'transferWithMemo' | 'transferFromWithMemo'
+    >
+  > {
+    return simulateContract(client, {
+      ...pickWriteParameters(parameters as never),
+      ...transfer.call(client, parameters as never),
+    } as never) as never
+  }
+
+  /**
+   * Extracts the `Transfer` event from logs.
    *
    * @param logs - Logs.
-   * @returns The event.
+   * @returns The `Transfer` event.
    */
   export function extractEvent(logs: Log[]) {
     const [log] = parseEventLogs({
@@ -3222,7 +3565,7 @@ export namespace transfer {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3243,34 +3586,45 @@ export async function transferSync<
   client: Client<Transport, chain, account>,
   parameters: transferSync.Parameters<chain, account>,
 ): Promise<transferSync.ReturnValue> {
-  const { throwOnReceiptRevert = true, ...rest } = parameters
+  const { amount, token, throwOnReceiptRevert = true } = parameters
+  const { decimals } = resolveToken(client, { token })
+  const resolved = internal_Token.resolveAmountDecimals(amount, decimals)
   const receipt = await transfer.inner(writeContractSync, client, {
-    ...rest,
+    ...parameters,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = transfer.extractEvent(receipt.logs)
   return {
     ...args,
+    ...(resolved === undefined
+      ? {}
+      : { decimals: resolved, formatted: formatUnits(args.amount, resolved) }),
     receipt,
   } as never
 }
 
 export namespace transferSync {
+  export type Args = transfer.Args
   export type Parameters<
     chain extends Chain | undefined = Chain | undefined,
     account extends Account | undefined = Account | undefined,
   > = transfer.Parameters<chain, account>
-
-  export type Args = transfer.Args
-
-  export type ReturnValue = GetEventArgs<
-    typeof Abis.tip20,
-    'Transfer',
-    { IndexedOnly: false; Required: true }
-  > & {
-    receipt: TransactionReceipt
-  }
-
+  export type ReturnValue = Compute<
+    GetEventArgs<
+      typeof Abis.tip20,
+      'Transfer',
+      { IndexedOnly: false; Required: true }
+    > & {
+      /** Token decimals used to derive `formatted`, if known. */
+      decimals?: number | undefined
+      /** Transferred amount formatted with the token's `decimals`, if known. */
+      formatted?: string | undefined
+      /** Transaction receipt. */
+      receipt: TransactionReceipt
+    }
+  >
   // TODO: exhaustive error type
   export type ErrorType = BaseErrorType
 }
@@ -3287,7 +3641,7 @@ export namespace transferSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3337,7 +3691,7 @@ export namespace unpause {
     parameters: unpause.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { token, ...rest } = parameters
-    const call = unpause.call({ token })
+    const call = unpause.call(client, { token })
     return (await action(client, {
       ...rest,
       ...call,
@@ -3359,26 +3713,29 @@ export namespace unpause {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.unpause.call({
+   *     actions.token.unpause.call(client, {
    *       token: '0x20c0...babe',
    *     }),
    *   ]
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token } = args
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'unpause',
       args: [],
@@ -3414,7 +3771,7 @@ export namespace unpause {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3439,6 +3796,8 @@ export async function unpauseSync<
     ...rest,
     throwOnReceiptRevert,
   } as never)
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = unpause.extractEvent(receipt.logs)
   return {
     ...args,
@@ -3478,7 +3837,7 @@ export namespace unpauseSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3531,7 +3890,7 @@ export namespace prepareUpdateQuoteToken {
     parameters: prepareUpdateQuoteToken.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { quoteToken, token, ...rest } = parameters
-    const call = prepareUpdateQuoteToken.call({ quoteToken, token })
+    const call = prepareUpdateQuoteToken.call(client, { quoteToken, token })
     return (await action(client, {
       ...rest,
       ...call,
@@ -3553,13 +3912,13 @@ export namespace prepareUpdateQuoteToken {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.prepareUpdateQuoteToken.call({
+   *     actions.token.prepareUpdateQuoteToken.call(client, {
    *       token: '0x20c0...babe',
    *       quoteToken: '0x20c0...cafe',
    *     }),
@@ -3567,16 +3926,19 @@ export namespace prepareUpdateQuoteToken {
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token, quoteToken } = args
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'setNextQuoteToken',
-      args: [TokenId.toAddress(quoteToken)],
+      args: [resolveToken(client, { token: quoteToken }).address],
     })
   }
 
@@ -3609,7 +3971,7 @@ export namespace prepareUpdateQuoteToken {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3635,6 +3997,8 @@ export async function prepareUpdateQuoteTokenSync<
     client,
     parameters,
   )
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = prepareUpdateQuoteToken.extractEvent(receipt.logs)
   return {
     ...args,
@@ -3679,7 +4043,7 @@ export namespace prepareUpdateQuoteTokenSync {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3729,7 +4093,7 @@ export namespace updateQuoteToken {
     parameters: updateQuoteToken.Parameters<chain, account>,
   ): Promise<ReturnType<action>> {
     const { token, ...rest } = parameters
-    const call = updateQuoteToken.call({ token })
+    const call = updateQuoteToken.call(client, { token })
     return (await action(client, {
       ...rest,
       ...call,
@@ -3751,26 +4115,29 @@ export namespace updateQuoteToken {
    * import { Actions } from 'viem/tempo'
    *
    * const client = createClient({
-   *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+   *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
    *   transport: http(),
    * }).extend(walletActions)
    *
    * const { result } = await client.sendCalls({
    *   calls: [
-   *     actions.token.updateQuoteToken.call({
+   *     actions.token.updateQuoteToken.call(client, {
    *       token: '0x20c0...babe',
    *     }),
    *   ]
    * })
    * ```
    *
-   * @param args - Arguments.
+   * @param parameters - Client (optional), followed by the call arguments.
    * @returns The call.
    */
-  export function call(args: Args) {
+  export function call<chain extends Chain | undefined>(
+    ...parameters: CallParameters<Args, Client<Transport, chain>>
+  ) {
+    const [client, args] = resolveCallParameters(parameters)
     const { token } = args
     return defineCall({
-      address: TokenId.toAddress(token),
+      address: resolveToken(client, { token }).address,
       abi: Abis.tip20,
       functionName: 'completeQuoteTokenUpdate',
       args: [],
@@ -3806,7 +4173,7 @@ export namespace updateQuoteToken {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3831,6 +4198,8 @@ export async function updateQuoteTokenSync<
     client,
     parameters,
   )
+  if ((receipt as TransactionReceipt).status === 'pending')
+    return { receipt } as never
   const { args } = updateQuoteToken.extractEvent(receipt.logs)
   return {
     ...args,
@@ -3873,7 +4242,7 @@ export namespace updateQuoteTokenSync {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3898,7 +4267,7 @@ export function watchApprove<
   const { onApproval, token, ...rest } = parameters
   return watchContractEvent(client, {
     ...rest,
-    address: TokenId.toAddress(token),
+    address: resolveToken(client, { token }).address,
     abi: Abis.tip20,
     eventName: 'Approval',
     onLogs: (logs) => {
@@ -3944,7 +4313,7 @@ export declare namespace watchApprove {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -3966,7 +4335,7 @@ export function watchBurn<
   const { onBurn, token, ...rest } = parameters
   return watchContractEvent(client, {
     ...rest,
-    address: TokenId.toAddress(token),
+    address: resolveToken(client, { token }).address,
     abi: Abis.tip20,
     eventName: 'Burn',
     onLogs: (logs) => {
@@ -4012,7 +4381,7 @@ export declare namespace watchBurn {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -4085,7 +4454,7 @@ export declare namespace watchCreate {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -4107,7 +4476,7 @@ export function watchMint<
   const { onMint, token, ...rest } = parameters
   return watchContractEvent(client, {
     ...rest,
-    address: TokenId.toAddress(token),
+    address: resolveToken(client, { token }).address,
     abi: Abis.tip20,
     eventName: 'Mint',
     onLogs: (logs) => {
@@ -4155,7 +4524,7 @@ export declare namespace watchMint {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -4180,7 +4549,7 @@ export function watchAdminRole<
   const { onRoleAdminUpdated, token, ...rest } = parameters
   return watchContractEvent(client, {
     ...rest,
-    address: TokenId.toAddress(token),
+    address: resolveToken(client, { token }).address,
     abi: Abis.tip20,
     eventName: 'RoleAdminUpdated',
     onLogs: (logs) => {
@@ -4226,7 +4595,7 @@ export declare namespace watchAdminRole {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -4248,7 +4617,7 @@ export function watchRole<
   const { onRoleUpdated, token, ...rest } = parameters
   return watchContractEvent(client, {
     ...rest,
-    address: TokenId.toAddress(token),
+    address: resolveToken(client, { token }).address,
     abi: Abis.tip20,
     eventName: 'RoleMembershipUpdated',
     onLogs: (logs) => {
@@ -4305,7 +4674,7 @@ export declare namespace watchRole {
  *
  * const client = createClient({
  *   account: privateKeyToAccount('0x...'),
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -4330,7 +4699,7 @@ export function watchTransfer<
   const { onTransfer, token, ...rest } = parameters
   return watchContractEvent(client, {
     ...rest,
-    address: TokenId.toAddress(token),
+    address: resolveToken(client, { token }).address,
     abi: Abis.tip20,
     eventName: 'Transfer',
     onLogs: (logs) => {
@@ -4376,7 +4745,7 @@ export declare namespace watchTransfer {
  * import { Actions } from 'viem/tempo'
  *
  * const client = createClient({
- *   chain: tempo({ feeToken: '0x20c0000000000000000000000000000000000001' })
+ *   chain: tempo.extend({ feeToken: '0x20c0000000000000000000000000000000000001' })
  *   transport: http(),
  * })
  *
@@ -4402,7 +4771,7 @@ export function watchUpdateQuoteToken<
   parameters: watchUpdateQuoteToken.Parameters,
 ) {
   const { onUpdateQuoteToken, token, ...rest } = parameters
-  const address = TokenId.toAddress(token)
+  const address = resolveToken(client, { token }).address
 
   return watchContractEvent(client, {
     ...rest,

@@ -47,6 +47,20 @@ export const gasPriceOracleAbi = [
     type: 'function',
   },
   {
+    inputs: [{ internalType: 'uint256', name: '_gasUsed', type: 'uint256' }],
+    name: 'getOperatorFee',
+    outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
+    inputs: [],
+    name: 'isJovian',
+    outputs: [{ internalType: 'bool', name: '', type: 'bool' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+  {
     inputs: [],
     name: 'l1BaseFee',
     outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
@@ -462,6 +476,22 @@ export const l2ToL1MessagePasserAbi = [
     type: 'function',
   },
   { stateMutability: 'payable', type: 'receive' },
+] as const
+
+export const disputeGameAbi = [
+  {
+    type: 'function',
+    name: 'l2SequenceNumber',
+    inputs: [],
+    outputs: [
+      {
+        name: 'l2SequenceNumber_',
+        type: 'uint256',
+        internalType: 'uint256',
+      },
+    ],
+    stateMutability: 'pure',
+  },
 ] as const
 
 export const disputeGameFactoryAbi = [

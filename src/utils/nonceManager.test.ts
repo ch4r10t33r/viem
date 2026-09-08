@@ -1,4 +1,4 @@
-import { beforeAll, expect, test } from 'vitest'
+import { beforeAll, expect, test, vi } from 'vitest'
 import { anvilMainnet } from '~test/anvil.js'
 import { generatePrivateKey } from '../accounts/generatePrivateKey.js'
 import { privateKeyToAccount } from '../accounts/privateKeyToAccount.js'
@@ -6,8 +6,13 @@ import {
   dropTransaction,
   getTransaction,
   sendTransaction,
+  sendTransactionSync,
   setBalance,
 } from '../actions/index.js'
+import { mainnet } from '../chains/index.js'
+import { createWalletClient } from '../clients/createWalletClient.js'
+import { custom } from '../clients/transports/custom.js'
+import { defineChain } from './chain/defineChain.js'
 import { createNonceManager, jsonRpc, nonceManager } from './nonceManager.js'
 import { parseEther } from './unit/parseEther.js'
 
@@ -178,6 +183,194 @@ test('nonceManager export', async () => {
       13,
     ]
   `)
+})
+
+test('reset clears consumed nonce cache', async () => {
+  const nonceManager = createNonceManager({
+    source: {
+      get: () => 1,
+      set: () => {},
+    },
+  })
+
+  expect(await nonceManager.consume(mainnetArgs)).toBe(1)
+
+  nonceManager.reset(mainnetArgs)
+
+  expect(await nonceManager.consume(mainnetArgs)).toBe(1)
+})
+
+test('get preserves consumed nonce cache', async () => {
+  const nonceManager = createNonceManager({
+    source: {
+      get: () => 1,
+      set: () => {},
+    },
+  })
+
+  expect(await nonceManager.consume(mainnetArgs)).toBe(1)
+  expect(await nonceManager.get(mainnetArgs)).toBe(2)
+  expect(await nonceManager.consume(mainnetArgs)).toBe(2)
+})
+
+test('failed sendTransaction resets consumed nonce', async () => {
+  const nonceManager = createNonceManager({
+    source: jsonRpc(),
+  })
+  const account = privateKeyToAccount(privateKey, { nonceManager })
+  const client = createWalletClient({
+    chain: mainnet,
+    transport: custom({
+      async request({ method }) {
+        if (method === 'eth_getTransactionCount') return '0x1'
+        if (method === 'eth_sendRawTransaction')
+          throw new Error('rate limit exceeded')
+        return '0x0'
+      },
+    }),
+  })
+
+  await expect(
+    sendTransaction(client, {
+      account,
+      gas: 21_000n,
+      maxFeePerGas: 1n,
+      maxPriorityFeePerGas: 1n,
+      to: account.address,
+      value: 1n,
+    }),
+  ).rejects.toThrow()
+
+  expect(
+    await nonceManager.consume({
+      address: account.address,
+      chainId: mainnet.id,
+      client,
+    }),
+  ).toBe(1)
+})
+
+test('failed sendTransactionSync resets consumed nonce', async () => {
+  const nonceManager = createNonceManager({
+    source: jsonRpc(),
+  })
+  const account = privateKeyToAccount(privateKey, { nonceManager })
+  const client = createWalletClient({
+    chain: mainnet,
+    transport: custom({
+      async request({ method }) {
+        if (method === 'eth_getTransactionCount') return '0x1'
+        if (method === 'eth_sendRawTransactionSync')
+          throw new Error('rate limit exceeded')
+        return '0x0'
+      },
+    }),
+  })
+
+  await expect(
+    sendTransactionSync(client, {
+      account,
+      gas: 21_000n,
+      maxFeePerGas: 1n,
+      maxPriorityFeePerGas: 1n,
+      to: account.address,
+      value: 1n,
+    }),
+  ).rejects.toThrow()
+
+  expect(
+    await nonceManager.consume({
+      address: account.address,
+      chainId: mainnet.id,
+      client,
+    }),
+  ).toBe(1)
+})
+
+test('failed sendTransaction does not reset an unconsumed nonce', async () => {
+  const nonceManager = createNonceManager({
+    source: {
+      get: () => 1,
+      set: () => {},
+    },
+  })
+  const consume = vi.spyOn(nonceManager, 'consume')
+  const reset = vi.spyOn(nonceManager, 'reset')
+  const account = privateKeyToAccount(privateKey, { nonceManager })
+  const chain = defineChain({
+    ...mainnet,
+    async prepareTransactionRequest(request) {
+      return { ...request, nonce: 1 }
+    },
+  })
+  const client = createWalletClient({
+    chain,
+    transport: custom({
+      async request({ method }) {
+        if (method === 'eth_sendRawTransaction')
+          throw new Error('rate limit exceeded')
+        return '0x0'
+      },
+    }),
+  })
+
+  await expect(
+    sendTransaction(client, {
+      account,
+      chainId: chain.id,
+      gas: 21_000n,
+      gasPrice: 1n,
+      to: account.address,
+      type: 'legacy',
+      value: 1n,
+    }),
+  ).rejects.toThrow()
+
+  expect(consume).not.toHaveBeenCalled()
+  expect(reset).not.toHaveBeenCalled()
+})
+
+test('failed sendTransactionSync does not reset an unconsumed nonce', async () => {
+  const nonceManager = createNonceManager({
+    source: {
+      get: () => 1,
+      set: () => {},
+    },
+  })
+  const consume = vi.spyOn(nonceManager, 'consume')
+  const reset = vi.spyOn(nonceManager, 'reset')
+  const account = privateKeyToAccount(privateKey, { nonceManager })
+  const chain = defineChain({
+    ...mainnet,
+    async prepareTransactionRequest(request) {
+      return { ...request, nonce: 1 }
+    },
+  })
+  const client = createWalletClient({
+    chain,
+    transport: custom({
+      async request({ method }) {
+        if (method === 'eth_sendRawTransactionSync')
+          throw new Error('rate limit exceeded')
+        return '0x0'
+      },
+    }),
+  })
+
+  await expect(
+    sendTransactionSync(client, {
+      account,
+      chainId: chain.id,
+      gas: 21_000n,
+      gasPrice: 1n,
+      to: account.address,
+      type: 'legacy',
+      value: 1n,
+    }),
+  ).rejects.toThrow()
+
+  expect(consume).not.toHaveBeenCalled()
+  expect(reset).not.toHaveBeenCalled()
 })
 
 test('dropped tx', async () => {

@@ -260,6 +260,8 @@ test('sends transaction (w/ serializer)', async () => {
       account: privateKeyToAccount(sourceAccount.privateKey),
       to: targetAccount.address,
       value: parseEther('1'),
+      maxFeePerGas: parseGwei('10.3875'),
+      maxPriorityFeePerGas: parseGwei('1'),
     }),
   ).rejects.toThrowError()
 
@@ -725,6 +727,30 @@ describe('args: chain', async () => {
         value: parseEther('1'),
       }),
     ).toBeDefined
+  })
+
+  test('behavior: null uses the client transaction envelope serializer', async () => {
+    const chain = defineChain({
+      ...anvilMainnet.chain,
+      serializers: {
+        transactionEnvelope() {
+          throw new Error('client transaction envelope serializer')
+        },
+      },
+    })
+    const client = createWalletClient({
+      chain,
+      transport: anvilMainnet.clientConfig.transport,
+    })
+
+    await expect(
+      sendTransactionSync(client, {
+        account: privateKeyToAccount(sourceAccount.privateKey),
+        chain: null,
+        to: targetAccount.address,
+        value: parseEther('1'),
+      }),
+    ).rejects.toThrowError('client transaction envelope serializer')
   })
 
   test('chain mismatch', async () => {
@@ -1973,5 +1999,68 @@ describe('behavior: client dataSuffix', () => {
 
     const tx = await getTransaction(client, { hash: receipt.transactionHash })
     expect(tx.input).toBe(concatHex([baseData, '0x12345678']))
+  })
+})
+
+describe('behavior: sendTransactionSync dataSuffix', () => {
+  test('sends transaction with sendTransactionSync dataSuffix (hex string)', async () => {
+    await setup()
+
+    let capturedData: string | undefined
+
+    const walletClient = createWalletClient({
+      chain: anvilMainnet.chain,
+      transport: http(anvilMainnet.rpcUrl.http),
+      dataSuffix: '0xabc',
+    })
+
+    walletClient.request = async (params: any) => {
+      if (
+        params.method === 'eth_sendTransaction' ||
+        params.method === 'wallet_sendTransaction'
+      ) {
+        capturedData = params.params[0].data
+        throw new Error('Test interception - data captured')
+      }
+      throw new Error('Unexpected method')
+    }
+
+    await expect(
+      sendTransaction(walletClient, {
+        account: sourceAccount.address,
+        to: targetAccount.address,
+        value: parseEther('1'),
+        gas: 100_000n,
+        dataSuffix: '0x12345678',
+      }),
+    ).rejects.toThrow('Test interception - data captured')
+
+    expect(capturedData).toBe('0x12345678')
+  })
+
+  test('sends transaction with sendTransactionSync dataSuffix (local account)', async () => {
+    await setup()
+
+    const walletClient = createWalletClient({
+      chain: anvilMainnet.chain,
+      transport: http(anvilMainnet.rpcUrl.http),
+      dataSuffix: '0xabc',
+    })
+
+    const [receipt] = await Promise.all([
+      sendTransaction(walletClient, {
+        account: privateKeyToAccount(sourceAccount.privateKey),
+        to: targetAccount.address,
+        value: parseEther('1'),
+        dataSuffix: '0x12345678',
+      }),
+      (async () => {
+        await wait(500)
+        await mine(client, { blocks: 1 })
+      })(),
+    ])
+
+    const tx = await getTransaction(client, { hash: receipt.transactionHash })
+    expect(tx.input).toBe('0x12345678')
   })
 })

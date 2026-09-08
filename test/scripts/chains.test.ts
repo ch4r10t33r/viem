@@ -9,6 +9,32 @@ const defaultTimeout = 10_000
 
 const chains = Object.values(allChains) as readonly allChains.Chain[]
 
+test('Tempo factory addresses', () => {
+  expect({
+    tempo: allChains.tempo.contracts,
+    tempoModerato: allChains.tempoModerato.contracts,
+  }).toMatchInlineSnapshot(`
+    {
+      "tempo": {
+        "earnFactory": {
+          "address": "0xb5889A96114014d4C032ebD76772c10bF3b97137",
+        },
+        "erc4626EngineFactory": {
+          "address": "0xd43D00981222a8db444A528E69f19E3cE5A7D2Ff",
+        },
+      },
+      "tempoModerato": {
+        "earnFactory": {
+          "address": "0xb5889A96114014d4C032ebD76772c10bF3b97137",
+        },
+        "erc4626EngineFactory": {
+          "address": "0xd43D00981222a8db444A528E69f19E3cE5A7D2Ff",
+        },
+      },
+    }
+  `)
+})
+
 describe.each(chains)('$name', ({ name, ...chain }) => {
   const rpcUrls = chain.rpcUrls
   const blockExplorer = chain.blockExplorers?.default
@@ -71,16 +97,15 @@ describe.each(chains)('$name', ({ name, ...chain }) => {
     async () => {
       if (!blockExplorer?.apiUrl) return
 
-      const response = await fetch(
-        `${
-          blockExplorer.apiUrl
-        }?module=block&action=getblocknobytime&closest=before&timestamp=${Math.floor(
-          Date.now() / 1000,
-        )}`,
-        {
-          headers: { 'Content-Type': 'application/json' },
-        },
-      )
+      const apiUrl = new URL(blockExplorer.apiUrl)
+      apiUrl.searchParams.set('module', 'block')
+      apiUrl.searchParams.set('action', 'getblocknobytime')
+      apiUrl.searchParams.set('closest', 'before')
+      apiUrl.searchParams.set('timestamp', `${Math.floor(Date.now() / 1000)}`)
+
+      const response = await fetch(apiUrl, {
+        headers: { 'Content-Type': 'application/json' },
+      })
       const data = await response.json()
       expect(data).toMatchObject({
         status: '1',
